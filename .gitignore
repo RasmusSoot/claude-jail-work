@@ -31,6 +31,7 @@ allure-behavior-snippets/
 openrouter-operator/
 circles/
 circles-iac/
+hardware/
 
 # composed session card (written by tools/jail-entrypoint.sh at container start;
 # the homelab checkout gitignores its own copy) — claude-jail#1
