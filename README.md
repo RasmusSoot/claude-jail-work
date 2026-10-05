@@ -1,163 +1,55 @@
-# Claude Code — Docker Jail
+# claude-jail-work — Docker jails for Claude Code, one per client
 
-Runs Claude Code in an isolated Docker container with full permissions, persistent memory, and host file access. Files written inside the container are owned by your host user.
+The work variant of [claude-jail](https://github.com/teststuffstash/claude-jail): Claude Code in a
+container that holds only one client's repositories and a few scoped, short-lived credentials,
+under whatever permission mode the account's managed policy allows.
 
-## Architecture
+**Design rule:** tokens + git are the boundaries. A jail's credentials cannot write to an upstream
+repository or mutate a client cluster, so the container needs no command filter to be safe.
+The reasoning and the credential inventory are kept with the jail design notes (outside this repo
+until they are client-free enough to publish).
 
-```mermaid
-graph LR
-    subgraph host["Host Machine"]
-        H1["~/Projects/"]
-        H2["~/Projects/.claude-data/"]
-        H3["~/Projects/.claude-data.json"]
-        H4["~/Projects/.claude-data.zsh_history"]
-        H5["~/.zshrc · ~/.oh-my-zsh/"]
-        H6[".env: HOST_UID · HOST_GID · GH_TOKEN"]
-        BROWSER["Browser"]
-    end
+## Layout on the host
 
-    subgraph jail["Docker Jail — node:22-bookworm"]
-        J1["/workspace"]
-        J2["/home/node/.claude/"]
-        J3["/home/node/.claude.json"]
-        J4["/home/node/.zsh_history"]
-        J5["shell config"]
-        TINI(["tini · PID 1"])
-        CLAUDE(["claude CLI"])
-        UP["upload server :8000"]
-        CB["OAuth listener :54545"]
-    end
-
-    subgraph ext["External"]
-        AI(["claude.ai — Pro / Max"])
-        GH(["GitHub — teststuffstash"])
-    end
-
-    H1 -- "rw" --> J1
-    H2 -- "rw" --> J2
-    H3 -- "rw" --> J3
-    H4 -- "rw" --> J4
-    H5 -- "ro" --> J5
-    H6 -. "env vars" .-> CLAUDE
-    TINI -- "spawns" --> CLAUDE
-    TINI -- "spawns (bg)" --> UP
-    BROWSER -- "drag / paste files" --> UP
-    CLAUDE -- "1. /login opens" --> BROWSER
-    BROWSER -- "2. authenticate" --> AI
-    AI -- "3. redirect to localhost:54545" --> BROWSER
-    BROWSER -- "4. callback" --> CB
-    CB -- "5. token" --> CLAUDE
-    CLAUDE -- "fine-grained PAT" --> GH
 ```
-
-Claude runs as a non-root user with your host UID/GID — files created in `/workspace` appear on the host owned by you, no `chown` needed. The `node` user has passwordless sudo so packages can be installed mid-session (`sudo apt-get install ...`); such installs live only in the container's writable layer and are lost on rebuild, so add anything you want to keep to the `Dockerfile`. Note that since `node` is remapped to host UID/GID, sudo→root inside the container has host-root reach over the mounted `~/Projects`.
+~/claude/claude-jail-work/          this repo (the mechanism)
+~/claude/jail/<client>/<repo>/      per-client workspaces — each repo: `upstream` fetch-only, `origin` = your fork
+~/claude/jail/.env.<client>         tokens + client FACTS (gitignored, chmod 600; created on first launch)
+~/claude/jail/.claude-data*         Claude state: shared login + per-client memory/history
+```
 
 ## Bootstrap
 
-### 1. Build
-
 ```bash
-./setup-env.sh
+./setup-env.sh            # writes .env (UID/GID, JAIL_HOME), pre-creates state files, generates the zsh override
 docker compose build
+source .aliases           # or add to ~/.zshrc
+jail-main                 # the login jail: run /login here once (it maps the OAuth port on loopback)
+siva                      # a client jail: tools/client-jail.sh siva
 ```
 
-`setup-env.sh` writes your UID/GID to `.env` and generates `docker-compose.override.yml` with whichever zsh dotfiles exist on your host. Re-run it if your dotfiles change.
+Per client you need: a `clients/<name>.conf` (see `clients/siva.conf`), the repos cloned under
+`~/claude/jail/<name>/`, and the env file filled in. Identities, by design:
 
-### 2. Run
-
-Use the `main` alias from `.aliases` (it publishes the upload + OAuth ports):
-
-```bash
-main   # = docker compose run --rm -p 8000:8000 -p 54545:54545 claude
-```
-
-For project sessions use the other `.aliases` shortcuts (`car-fleet`, `homelab`, `life`) — see [Upload server & ports](#upload-server--ports). Compose itself declares no `ports:`; each alias publishes its own with `-p`.
-
-### 3. Log in
-
-From the **main** jail (it's the only session that maps the OAuth callback port `54545`), run:
-
-```
-/login
-```
-
-This authenticates via your claude.ai account (Pro or Max). The token is persisted in `~/Projects/.claude-data/` and reused by every other session — you only log in once.
-
-### 4. GitHub CLI (optional)
-
-GitHub doesn't support pre-selecting fine-grained token permissions via URL, so you'll need to configure these manually.
-
-**First, enable fine-grained PATs in your org:**
-`https://github.com/organizations/teststuffstash/settings/personal-access-tokens`
-→ Allow access via fine-grained personal access tokens
-
-**Then create the token:**
-[Open token creation →](https://github.com/settings/personal-access-tokens/new?description=claude-jail&resource_owner=teststuffstash)
-
-Configure it as follows:
-
-| Field | Value |
-|---|---|
-| Resource owner | `teststuffstash` |
-| Repository access | All repositories |
-| Administration | Read and Write |
-| Contents | Read and Write |
-| Issues | Read and Write |
-| Metadata | Read (auto) |
-| Pull requests | Read and Write |
-| Workflows | Read and Write |
-| Everything else | No access |
-
-Then add it to `.env`:
-
-```bash
-GH_TOKEN=github_pat_...
-```
-
-Repo deletions are recoverable — org owners can restore deleted repos via GitHub settings for 90 days.
-
-## What's inside
-
-| Path (container) | Path (host) | Notes |
+| Purpose | Credential | Reach |
 |---|---|---|
-| `/workspace` | `~/Projects` | Read-write. Your working directory. |
-| `/home/node/.claude/` | `~/Projects/.claude-data/` | Memory, history, settings. |
-| `/home/node/.claude.json` | `~/Projects/.claude-data.json` | Onboarding state (theme, startup count). |
-| `/home/node/.zsh_history` | `~/Projects/.claude-data.zsh_history` | Shell history. |
-| `/home/node/.gitconfig` | `~/Projects/.claude-data.gitconfig` | Jail-only git identity; host `~/.gitconfig` is intentionally not mounted. |
-| `/home/node/.zshrc` | `~/.zshrc` | Read-only. |
-| `/home/node/.oh-my-zsh/` | `~/.oh-my-zsh/` | Read-write (plugin installs persist). |
+| GitHub forks | fine-grained PAT, resource owner = your trust-domain org, Contents R/W + Metadata, no Pull requests | the org's forks only |
+| Client GitLab, read | personal token, `read_repository` | fetch upstream |
+| Client GitLab, write | deploy token, `write_repository`, on YOUR fork inside the client's GitLab, protected `main` | that fork's unprotected branches |
+| Local kind | namespace-admin ServiceAccount, minted per launch, 8 h | one namespace, plain `kubectl` |
+| Client dev cluster | read-only ServiceAccount, minted per launch after impersonation proves it cannot mutate or read secrets, 8 h | `kdev` only |
 
-## Upload server & ports
+## What the launcher does (`tools/client-jail.sh`)
 
-`tini` runs as PID 1 and auto-starts the file-drop upload server (`tools/upload/upload.py`) in the background before launching `claude` — see `tools/jail-entrypoint.sh`. It lets you paste/drag screenshots and docs from the host into the jail. Dropped files land in each project's gitignored `uploads/` inbox; move them out of `uploads/` to commit. Details in `tools/upload/README.md`.
+1. Reads `clients/<client>.conf` and `~/claude/jail/.env.<client>`; refuses to continue without the shared login file.
+2. Mints the kind token and, if configured, the dev token — each checked for JWT shape and for the
+   expected `sub` claim before it is injected; the dev ServiceAccount is checked by impersonation first.
+3. Mounts only the client's repo dirs, the per-client Claude state and the shared credentials file.
+4. Joins the client's kind Docker network, publishes the upload UI on a loopback port, and starts
+   `claude` with no bypass flag. `tools/client-jail-init.sh` then builds the per-host git credential
+   store, writes `~/.kube/kind.yaml` and `~/.kube/dev.yaml`, and renders the session card.
 
-To run several sessions at once without port clashes, the **container** always serves the upload UI on `8000` while each alias publishes its own **host** port with `-p` (compose declares no `ports:`):
+## Not in this variant
 
-| Session | Upload UI (host) | OAuth (host) |
-|---|---|---|
-| `main` (`~/Projects`) | `localhost:8000` | `54545` ← log in here |
-| car-fleet | `localhost:8001` | — |
-| homelab | `localhost:8002` | — |
-| life | `localhost:8003` | — |
-
-The **main** jail runs from `~/Projects` for general/infra work and is the only session that maps the OAuth port, so it's the only one that can complete `/login` (the callback is fixed to `localhost:54545`). The project jails don't publish it at all. Log in once via `main`; the token persists in `.claude-data/` and works in every other session.
-
-## Cross-jail handoff
-
-During big platform rollouts a stack session (e.g. oracle) often needs quick homelab-side work
-from the mono session without GitHub-issue latency or copy-pasting between terminals. A shared
-file-drop channel covers this: the stack jail writes task files to `/workspace/.handoff/inbox/`
-(host `~/Projects/.handoff/<stack>/`, mounted per stack by `tools/stack-jail.sh`), and the mono
-session processes them with `/handoff` — typically looped, `/loop /handoff`. Results come back in
-`done/`. Protocol, file format, and boundaries: [`tools/handoff.md`](tools/handoff.md). It's a
-speed channel for attended sessions, not a tracker — durable outcomes still land in issues/docs.
-
-## Re-running
-
-```bash
-main        # general/infra jail (also where you /login)
-car-fleet   # or homelab / life
-```
-
-No rebuild needed unless you update the `Dockerfile`. Re-run `setup-env.sh` if your zsh dotfiles change.
+Passwordless sudo, the Docker socket, host kubeconfig or SSH keys, cross-jail handoff channels,
+and any OpenRouter / OpenCode routing. Image builds and pushes happen in CI or by the human.

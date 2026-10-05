@@ -30,7 +30,7 @@ ctx=${ctx:-0}
 
 # Model context window. 1M variants encode it in the id.
 case "$model" in
-  *1m*|*opus-4-7*) ctx_max=1000000 ;;
+  *1m*) ctx_max=1000000 ;;
   *)               ctx_max=200000  ;;
 esac
 
@@ -111,8 +111,8 @@ left=$(fmt_left "$five_reset")
 
 # CWD label: map container paths back to host-visible paths.
 case "$cwd" in
-  /workspace)    cwd_short="~/Projects" ;;
-  /workspace/*)  cwd_short="~/Projects/${cwd#/workspace/}" ;;
+  /workspace)    cwd_short="jail" ;;
+  /workspace/*)  cwd_short="jail/${cwd#/workspace/}" ;;
   /home/node)    cwd_short="~" ;;
   /home/node/*)  cwd_short="~/${cwd#/home/node/}" ;;
   "")            cwd_short="" ;;

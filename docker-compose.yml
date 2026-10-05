@@ -1,4 +1,7 @@
 services:
+  # LOGIN / MECHANISM jail: mounts only THIS repo. The only session that maps the OAuth callback
+  # port 54545 (via the `jail-main` alias), so log in here once; every client jail shares the token
+  # through the single-file .credentials.json mount below.
   claude:
     build:
       context: .
@@ -7,55 +10,35 @@ services:
         HOST_GID: ${HOST_GID}
     working_dir: /workspace
     environment:
-      # Folder the auto-started upload server drops files into (a gitignored
-      # uploads/ inbox, set per project in .aliases). Server always on port 8000.
       UPLOAD_DIR: ${UPLOAD_DIR:-/workspace/uploads}
-      # Per-jail identity on the OTLP telemetry (homelab#566): the collector already
-      # promotes resource attrs to metric labels, so jail_name lands in Prometheus and
-      # `sum by (jail_name, session_id)` answers "which jail burned what". JAIL_NAME is
-      # set by each alias in .aliases (default main). This is the SINGLE writer of
-      # OTEL_RESOURCE_ATTRIBUTES — the old copy in .claude-data/settings.json was
-      # removed 2026-08-18 (a shared-file value cannot differ per container, and env
-      # precedence between the two sources is ambiguity nobody needs).
-      OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,stack=jail,jail.name=${JAIL_NAME:-main}
+      # Per-jail OTLP identity. NOTE: an employer-managed policy delivered through the login
+      # (remote managed settings) may set OTEL_RESOURCE_ATTRIBUTES itself; the managed value wins.
+      OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,jail.name=${JAIL_NAME:-main}
     volumes:
-      - ${HOME}/Projects:/workspace
-      - ${HOME}/Projects/.claude-data:/home/node/.claude
-      # Overlay the credentials file as a SINGLE-FILE mount on top of the dir
-      # mount, matching the stack service. On a file mountpoint the CLI's atomic
-      # rename fails (EBUSY) and it falls back to an in-place copy, so the host
-      # inode never changes. Without this, a mono-jail token refresh renames a
-      # new inode into .claude-data/ and every stack jail (pinned to the old
-      # inode by its file mount) drifts stale → "Login expired" within ~8h.
-      - ${HOME}/Projects/.claude-data/.credentials.json:/home/node/.claude/.credentials.json
-      - ${HOME}/Projects/.claude-data.json:/home/node/.claude.json
-      # Jail-only git identity. Host ~/.gitconfig is deliberately NOT mounted so
-      # the jail can use its own author name/email. Edit .claude-data.gitconfig.
-      - ${HOME}/Projects/.claude-data.gitconfig:/home/node/.gitconfig
-      # Shared Nix store so Devbox tooling (per-project devbox.json) works identically in
-      # the jail and on the host. Requires Nix/Devbox installed on the host (it provides /nix).
+      - .:/workspace
+      - ${JAIL_HOME}/.claude-data:/home/node/.claude
+      # Single-file overlay on top of the dir mount: on a file mountpoint the CLI's atomic rename
+      # fails (EBUSY) and it falls back to an in-place write, so the host inode never changes and
+      # every client jail (pinned to that inode by its own file mount) sees token refreshes.
+      - ${JAIL_HOME}/.claude-data/.credentials.json:/home/node/.claude/.credentials.json
+      - ${JAIL_HOME}/.claude-data.json:/home/node/.claude.json
+      # Jail-only git identity; the host ~/.gitconfig is deliberately NOT mounted.
+      - ${JAIL_HOME}/.claude-data.gitconfig:/home/node/.gitconfig
+      # Shared Nix store: per-project devbox.json works identically in the jail and on the host.
       - /nix:/nix
-    # No ports: here on purpose. Each alias in .aliases publishes its own host
-    # ports with -p (e.g. -p 8001:8000), so sessions don't collide and only the
-    # main jail maps the OAuth port 54545.
+    # No ports: here on purpose — aliases publish them, loopback only.
     stdin_open: true
     tty: true
     env_file:
       - .env
 
-  # Generic STACK-JAIL service (middle-ground permissions, see tools/stack-jail.sh
-  # header). One service for every per-stack jail — everything stack-specific
-  # (project mounts, state files, tokens, UPLOAD_DIR) is passed by the launcher
-  # via `docker compose run -v/-e`, so a new stack jail is a case-block entry in
-  # tools/stack-jail.sh, not a compose edit. Never `docker compose run stack`
-  # directly. Differences from `claude` on purpose:
-  #   - NO ~/Projects mount: only the stack dirs the launcher passes (homelab is
-  #     shallow-cloned inside by tools/stack-jail-init.sh — the host checkout
-  #     holds gitignored secrets: tofu state, kubeconfigs)
-  #   - per-stack .claude-data-<stack> state (the mono jail's ~/.claude holds
-  #     the homelab-* secret dirs; they must not leak into a stack jail)
-  #   - no .env: the launcher sources .env.<stack> and passes only its keys
-  stack:
+  # PER-CLIENT jail. One generic service; everything client-specific (repo mounts, state files,
+  # tokens, kubeconfig material) is passed by tools/client-jail.sh via `docker compose run -v/-e`.
+  # Never `docker compose run client` directly. Differences from `claude` on purpose:
+  #   - no repo mount of this repo except tools/ (read-only): the upload server, init, kdev
+  #   - per-client ~/.claude state; only the credentials file crosses over from the login jail
+  #   - joins the client's kind Docker network so the API server is reachable by container name
+  client:
     build:
       context: .
       args:
@@ -63,20 +46,16 @@ services:
         HOST_GID: ${HOST_GID}
     working_dir: /workspace
     environment:
-      # Same per-jail OTLP identity as the claude service (homelab#566); stack-jail.sh
-      # sets JAIL_NAME="<stack>-stack" and passes it through.
-      OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,stack=jail,jail.name=${JAIL_NAME:-stack}
+      OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,jail.name=${JAIL_NAME:-client}
     volumes:
-      # tools/ read-only: the upload server + stack-jail-init.sh live here
-      - ${HOME}/Projects/tools:/workspace/tools:ro
-      # Subscription OAuth shared with the mono jail — the proven login-once
-      # pattern (multiple jail sessions already share this file live). Only the
-      # credentials file crosses over; the rest of .claude-data/ (homelab-*
-      # secret dirs) stays out of stack jails.
-      - ${HOME}/Projects/.claude-data/.credentials.json:/home/node/.claude/.credentials.json
-      # Shared jail git identity, read-only at a side path; stack-jail-init.sh
-      # copies it to ~/.gitconfig and appends the per-repo credential config.
-      - ${HOME}/Projects/.claude-data.gitconfig:/home/node/.gitconfig-base:ro
+      - ./tools:/workspace/tools:ro
+      - ${JAIL_HOME}/.claude-data.gitconfig:/home/node/.gitconfig-base:ro
       - /nix:/nix
+    networks: [default, kind]
     stdin_open: true
     tty: true
+
+networks:
+  kind:
+    external: true
+    name: ${KIND_NET:-kind}

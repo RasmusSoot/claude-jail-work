@@ -1,61 +1,45 @@
 # Jail card — container ground rules for every jail session
 
-<!-- The ONE versioned home for jail-session ground rules (claude-jail#1, homelab FU-117).
-Composed into the session at container start — never hand-pasted, never edited at the
-composition target (edit THIS file):
-  - mono jail: tools/jail-entrypoint.sh writes it to /workspace/CLAUDE.local.md, and
-    additionally composes homelab's agents/jail-seat-card.md to
-    /workspace/homelab/CLAUDE.local.md (homelab-scoped, seat sessions only);
-  - stack jail: tools/stack-jail-init.sh prepends its rendered per-stack env card and
-    writes the pair to /workspace/CLAUDE.local.md (container-local). Stack jails get NO
-    homelab seat card by design — see the seat card's header for why. -->
+<!-- The ONE versioned home for jail-session ground rules. Composed into the session at container
+start — never hand-pasted, never edited at the composition target (edit THIS file):
+  - login jail: tools/jail-entrypoint.sh writes it to /workspace/CLAUDE.local.md;
+  - client jail: tools/client-jail-init.sh prepends its rendered per-client card and writes the
+    pair to /workspace/CLAUDE.local.md (container-local). -->
 
-You are running inside a Docker container with full permissions. All actions are
-pre-approved — do not ask for confirmation before running commands, editing files, or
-installing packages.
+You are running inside a Docker container that holds only this client's repositories and a small
+set of scoped credentials. The permission mode is whatever the account's policy allows; do not try
+to change it, and do not build wrappers around commands the policy denies — a denied push means the
+human pushes.
+
+## The boundaries (tokens + git — everything else is scenery)
+
+- **git**: `upstream` remotes are fetch-only. `origin` is the human's fork and the only place any
+  token here can write. Protected `main` on the fork rejects direct pushes. Code reaches upstream
+  through a merge request the human opens under their own name. Add a `Co-Authored-By` trailer to
+  commits you author.
+- **kubectl**: plain `kubectl` is the LOCAL KIND cluster (namespace-admin, disposable — destructive
+  verbs are fine there). `kdev` is the CLIENT DEV cluster, read-only by three layers; it refuses
+  mutating verbs and secrets. Never set `KUBECONFIG` by hand, never `use-context`, never merge the
+  two files. Every `kdev` call prints its cluster banner — read it.
+- **No client fact in any repo**: CIDRs, hostnames, ServiceAccount names, the GitLab URL — these
+  live in the human's gitignored env file. Charts and configs you write come from public sources
+  or from the client's own repo, never retyped into a third place.
+- **Secrets**: if a command output contains a token, key or personal data, say so generically and
+  do not echo it. `kdev` cannot read secrets on purpose; do not look for another way.
 
 ## Environment
 
-- Container base: `node:22-bookworm` (Debian, running as `node` user remapped to host
-  UID/GID)
-- The `node` user has **passwordless sudo** — install packages directly with
-  `sudo apt-get install ...` (installs are ephemeral; add to claude-jail's `Dockerfile`
-  to persist them)
-- **Project tooling is Devbox/Nix, not apt.** For per-project CLI tools (tofu, kubectl,
-  talosctl, helm, …) prefer a committed `devbox.json` + `devbox shell` over ephemeral
-  `sudo apt`/`curl` installs. The `/nix` store is bind-mounted from the host, so the same
-  `devbox.json` works in the jail and on the host (and persists across rebuilds).
-  `devbox.lock` is committed for deterministic versions.
-- Memory and session history: persisted at `/home/node/.claude`, bind-mounted to the host
-  (`.claude-data/` for the mono jail, `.claude-data-<stack>/` per stack jail)
-- Two jail classes share this card. The **mono jail** mounts all of the host's
-  `~/Projects` at `/workspace` (read-write). A **stack jail** mounts only its stack's
-  repos plus `tools/`, and shallow-clones homelab inside the container — its session card
-  (prepended above this one) carries the per-stack facts: credentials, kubectl, ports.
-
-## Homelab platform services (S3, DB, dashboards, …)
-
-Many projects here build on the self-hosted **homelab** Kubernetes cluster. To discover
-what services exist (and which are only planned), **read
-[`/workspace/homelab/SERVICES.md`](/workspace/homelab/SERVICES.md) and grep it** — that
-catalog is the source of truth. **Do not `kubectl` around the cluster to discover
-services**, and do not assume a service exists until the catalog marks it `LIVE` (e.g.
-S3/Garage and Postgres/CloudNativePG are both LIVE). Statuses change — **recheck the
-catalog, never repeat a remembered status** (Postgres sat in this very sentence as
-"PLANNED" long after it went LIVE). How to consume one is linked from the catalog.
+- Container base: `node:22-bookworm`, running as `node` remapped to the host UID/GID; no sudo.
+- **Project tooling is Devbox/Nix, not apt.** The `/nix` store is bind-mounted from the host, so a
+  committed `devbox.json` works in the jail and on the host alike (`devbox install` on the host).
+- Memory and session history persist at `/home/node/.claude` (bind-mounted per client).
+- Published ports are loopback-only on the host; the upload server at `${UPLOAD_DIR}` has no auth.
 
 ## Behavior
 
-- Run commands without asking for permission first.
-- Prefer fixing things directly over explaining how to fix them.
-- Be concise. Skip trailing summaries.
-- **Prior-art check before creating anything named** (a doc, script, tracker entry, ADR,
-  manifest): these projects are heavily documented — assume the concern already has an
-  owner. Grep the project's docs/trackers/memory by topic keywords and state what you
-  found ("nothing matches <keywords>") before writing. If a related artifact exists,
-  extend it, never create a parallel one.
-- **Resolve references before acting on them.** When the user names a thing ("the
-  credential helper", "that follow-up", "the leaked PAT"), it exists — grep for it and
-  act on what you find, not on a reconstruction. Questions like "is this already tracked
-  somewhere?" are retrieval requests (the user half-remembers, without the exact
-  place/id), not decisions delegated to you.
+- Prefer fixing things directly over explaining how to fix them. Be concise.
+- **Prior-art check before creating anything named** (a doc, script, chart, manifest): grep the
+  repo first and say what you found before writing. Extend what exists; never create a parallel one.
+- **Resolve references before acting on them.** When the human names a thing, it exists — find it.
+- **Two clusters means every claim names its cluster.** "Works" is not a finding; "works on kind,
+  dev shows X" is.
