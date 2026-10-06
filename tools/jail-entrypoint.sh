@@ -4,11 +4,16 @@
 # own card (with the per-client env card prepended) in tools/client-jail-init.sh.
 set -e
 
-python3 /workspace/tools/upload/upload.py \
-  --dir "${UPLOAD_DIR:-/workspace}" \
+# Fresh token per container, handed to the server only (not exported to claude). The URL is printed
+# here because only the terminal user should get it; UPLOAD_HOST_PORT is the loopback port on the host.
+_upload_token=$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')
+UPLOAD_TOKEN="$_upload_token" python3 /workspace/tools/upload/upload.py \
+  --dir "${UPLOAD_DIR:-/workspace/uploads}" \
   --port 8000 \
   --host 0.0.0.0 \
   >/tmp/upload-server.log 2>&1 &
+echo "upload: http://127.0.0.1:${UPLOAD_HOST_PORT:-8000}/?t=$_upload_token" >&2
+unset _upload_token
 
 if [ -z "${CLIENT_NAME:-}" ]; then
   if [ -f /workspace/tools/jail-card.md ]; then

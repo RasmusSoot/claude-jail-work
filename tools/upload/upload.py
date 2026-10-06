@@ -2,14 +2,21 @@
 """Minimal upload server. Stdlib only. Paste from clipboard, drag-drop, or pick files.
 
 Usage:
-    python3 upload.py --dir /path/to/target [--port 8000] [--host 0.0.0.0]
+    UPLOAD_TOKEN=<secret> python3 upload.py --dir /path/to/target [--port 8000] [--host 0.0.0.0]
+
+Every request must carry the token (page: ?t=<token>; upload: X-Upload-Token header). The port is
+reachable by every container on the jail's Docker networks (kind pods, other jails) and by any web
+page in the host browser, so without it anyone could drop files where Claude reads them. The custom
+header also forces a CORS preflight, which this server never answers — cross-origin posts fail.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hmac
 import html
 import json
+import os
 import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +54,7 @@ PAGE = """<!doctype html>
 <h2 style="font-size:.9rem;margin:1.5rem 0 .5rem;color:#888">Uploaded this session</h2>
 <ul id="log"></ul>
 <script>
+const TOKEN = {token_js};
 const drop = document.getElementById('drop');
 const pick = document.getElementById('pick');
 const log  = document.getElementById('log');
@@ -70,7 +78,7 @@ async function upload(blob, name) {{
   try {{
     const r = await fetch('/upload', {{
       method: 'POST',
-      headers: {{ 'X-Filename': encodeURIComponent(name) }},
+      headers: {{ 'X-Filename': encodeURIComponent(name), 'X-Upload-Token': TOKEN }},
       body: blob,
     }});
     const j = await r.json();
@@ -133,7 +141,10 @@ def unique_path(target: Path) -> Path:
         i += 1
 
 
-def make_handler(target_dir: Path):
+def make_handler(target_dir: Path, token: str, max_bytes: int):
+    def token_ok(given: str) -> bool:
+        return hmac.compare_digest(given.encode(), token.encode())
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             sys.stderr.write(f"{self.address_string()} - {fmt % args}\n")
@@ -147,8 +158,13 @@ def make_handler(target_dir: Path):
             self.wfile.write(data)
 
         def do_GET(self):  # noqa: N802
-            if self.path == "/" or self.path == "/index.html":
-                body = PAGE.format(dir_html=html.escape(str(target_dir))).encode()
+            from urllib.parse import parse_qs, urlsplit
+            url = urlsplit(self.path)
+            if url.path in ("/", "/index.html"):
+                if not token_ok(parse_qs(url.query).get("t", [""])[0]):
+                    self.send_error(403, "missing or wrong ?t= token (see the launch output)")
+                    return
+                body = PAGE.format(dir_html=html.escape(str(target_dir)), token_js=json.dumps(token)).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -161,6 +177,9 @@ def make_handler(target_dir: Path):
             if self.path != "/upload":
                 self.send_error(404)
                 return
+            if not token_ok(self.headers.get("X-Upload-Token", "")):
+                self._json(403, {"ok": False, "error": "bad token"})
+                return
             raw_name = self.headers.get("X-Filename", "")
             try:
                 from urllib.parse import unquote
@@ -172,6 +191,9 @@ def make_handler(target_dir: Path):
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
                 self._json(400, {"ok": False, "error": "empty body"})
+                return
+            if length > max_bytes:
+                self._json(413, {"ok": False, "error": f"over {max_bytes // 2**20} MiB"})
                 return
             try:
                 with open(target, "wb") as f:
@@ -195,13 +217,18 @@ def main() -> int:
     ap.add_argument("--dir", required=True, type=Path, help="Target directory for uploads")
     ap.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
     ap.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
+    ap.add_argument("--max-mib", type=int, default=256, help="Per-upload size cap (default: 256)")
     args = ap.parse_args()
+    token = os.environ.get("UPLOAD_TOKEN", "")
+    if len(token) < 16:
+        print("upload: UPLOAD_TOKEN unset or short — refusing to serve without auth", file=sys.stderr)
+        return 2
 
     target_dir = args.dir.resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(target_dir))
-    print(f"Upload server: http://localhost:{args.port}  →  {target_dir}", file=sys.stderr)
+    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(target_dir, token, args.max_mib * 2**20))
+    print(f"Upload server: port {args.port} (token required)  →  {target_dir}", file=sys.stderr)
     print("Ctrl-C to stop.", file=sys.stderr)
     try:
         httpd.serve_forever()

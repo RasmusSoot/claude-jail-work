@@ -1,6 +1,6 @@
 services:
   # LOGIN / MECHANISM jail: mounts only THIS repo. The only session that maps the OAuth callback
-  # port 54545 (via the `jail-main` alias), so log in here once; every client jail shares the token
+  # port 54545 (via the `jail-main` alias), so log in here once; every stack jail shares the token
   # through the single-file .credentials.json mount below.
   claude:
     build:
@@ -10,6 +10,9 @@ services:
         HOST_GID: ${HOST_GID}
     working_dir: /workspace
     environment:
+      TZ: ${TZ:-Europe/Tallinn}
+      TERM: xterm-256color
+      COLORTERM: truecolor
       UPLOAD_DIR: ${UPLOAD_DIR:-/workspace/uploads}
       # Per-jail OTLP identity. NOTE: an employer-managed policy delivered through the login
       # (remote managed settings) may set OTEL_RESOURCE_ATTRIBUTES itself; the managed value wins.
@@ -19,26 +22,26 @@ services:
       - ${JAIL_HOME}/.claude-data:/home/node/.claude
       # Single-file overlay on top of the dir mount: on a file mountpoint the CLI's atomic rename
       # fails (EBUSY) and it falls back to an in-place write, so the host inode never changes and
-      # every client jail (pinned to that inode by its own file mount) sees token refreshes.
+      # every stack jail (pinned to that inode by its own file mount) sees token refreshes.
       - ${JAIL_HOME}/.claude-data/.credentials.json:/home/node/.claude/.credentials.json
       - ${JAIL_HOME}/.claude-data.json:/home/node/.claude.json
       # Jail-only git identity; the host ~/.gitconfig is deliberately NOT mounted.
       - ${JAIL_HOME}/.claude-data.gitconfig:/home/node/.gitconfig
-      # Shared Nix store: per-project devbox.json works identically in the jail and on the host.
-      - /nix:/nix
+      # Jail-only Nix store (named volume, seeded from the image) — never the host's /nix.
+      - jail-nix:/nix
     # No ports: here on purpose — aliases publish them, loopback only.
     stdin_open: true
     tty: true
     env_file:
       - .env
 
-  # PER-CLIENT jail. One generic service; everything client-specific (repo mounts, state files,
-  # tokens, kubeconfig material) is passed by tools/client-jail.sh via `docker compose run -v/-e`.
-  # Never `docker compose run client` directly. Differences from `claude` on purpose:
+  # PER-STACK jail. One generic service; everything stack-specific (repo mounts, state files,
+  # tokens, kubeconfig material) is passed by tools/stack-jail.sh via `docker compose run -v/-e`.
+  # Never `docker compose run stack` directly. Differences from `claude` on purpose:
   #   - no repo mount of this repo except tools/ (read-only): the upload server, init, kdev
-  #   - per-client ~/.claude state; only the credentials file crosses over from the login jail
+  #   - per-stack ~/.claude state; only the credentials file crosses over from the login jail
   #   - joins the client's kind Docker network so the API server is reachable by container name
-  client:
+  stack:
     build:
       context: .
       args:
@@ -46,14 +49,22 @@ services:
         HOST_GID: ${HOST_GID}
     working_dir: /workspace
     environment:
-      OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,jail.name=${JAIL_NAME:-client}
+      TZ: ${TZ:-Europe/Tallinn}
+      TERM: xterm-256color
+      COLORTERM: truecolor
+      OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,jail.name=${JAIL_NAME:-stack},jail.reads=${JAIL_READS:-none}
     volumes:
       - ./tools:/workspace/tools:ro
       - ${JAIL_HOME}/.claude-data.gitconfig:/home/node/.gitconfig-base:ro
-      - /nix:/nix
+      - jail-nix:/nix
     networks: [default, kind]
     stdin_open: true
     tty: true
+
+volumes:
+  # Shared by every jail (login + stacks), isolated from the host. `docker volume rm` it to reset;
+  # the next start re-seeds it from the image.
+  jail-nix:
 
 networks:
   kind:

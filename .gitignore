@@ -1,7 +1,6 @@
 # secrets / host-specific
 .env
 .env.*
-docker-compose.override.yml
 
 # claude state is never under this repo (it lives in ~/claude/jail), but just in case
 .claude-data/
