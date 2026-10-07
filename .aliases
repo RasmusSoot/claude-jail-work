@@ -5,5 +5,6 @@
 #   <stack>   — a per-stack jail via tools/stack-jail.sh (config: stacks/<stack>.conf +
 #                ~/claude/jail/.env.<stack>). Add one alias line per stack.
 alias jail-main='JAIL_NAME=main UPLOAD_DIR=/workspace/uploads docker compose -f ~/claude/claude-jail-work/docker-compose.yml run --rm -p 127.0.0.1:8000:8000 -p 127.0.0.1:54545:54545 claude'
+alias jail-pin='~/claude/claude-jail-work/tools/pin-aliases.sh'   # review + pin this file for the host shell
 alias siva='~/claude/claude-jail-work/tools/stack-jail.sh siva'
 alias ai-governance='~/claude/claude-jail-work/tools/stack-jail.sh ai-governance'

@@ -56,8 +56,8 @@ root="${STACK_NAME:-jail}"
 case "$cwd" in
   /workspace)    cwd_short="$root" ;;
   /workspace/*)  cwd_short="$root/${cwd#/workspace/}" ;;
-  /home/node)    cwd_short="~" ;;
-  /home/node/*)  cwd_short="~/${cwd#/home/node/}" ;;
+  /home/claude)    cwd_short="~" ;;
+  /home/claude/*)  cwd_short="~/${cwd#/home/claude/}" ;;
   *)             cwd_short="$cwd" ;;
 esac
 

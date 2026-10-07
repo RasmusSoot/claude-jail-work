@@ -108,7 +108,7 @@ for x in dirs:
 json.dump(d, open(target, "w"), indent=2)
 PY
 
-ERR_DIR=$(mktemp -d); trap 'rm -rf "$ERR_DIR"' EXIT          # mint stderr; no fixed /tmp names
+ERR_DIR=$(mktemp -d); trap 'rm -rf "$ERR_DIR"' EXIT          # mint stderr; no fixed /tmp names (cleanup() takes over later)
 # ── token gates shared by both mints ────────────────────────────────────────────────────────────
 is_jwt()  { printf '%s' "$1" | grep -qE '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; }
 jwt_sub() { # decode the JWT payload locally (base64url + padding) and print .sub; never prints the token
@@ -180,7 +180,7 @@ else
   echo "→ dev: no DEV_KUBE_* in $ENV_FILE — kdev unavailable this session"
 fi
 export STACK_KUBE_TOKEN STACK_KUBE_SERVER STACK_KUBE_CA STACK_KUBE_NS="$KIND_NS" STACK_KUBE_SA="$KIND_SA"
-export STACK_DEVKUBE_TOKEN STACK_DEVKUBE_SERVER STACK_DEVKUBE_CA STACK_DEVKUBE_NS="${DEV_KUBE_NS:-}" STACK_DEVKUBE_SA="${DEV_KUBE_SA:-}"
+export STACK_DEVKUBE_NS="${DEV_KUBE_NS:-}" STACK_DEVKUBE_SA="${DEV_KUBE_SA:-}"   # the dev token itself never enters the jail
 
 [ -f "$SHARED_CREDS" ] || { echo "⚠ $SHARED_CREDS missing — log in once via \`jail-main\` first" >&2; exit 1; }
 
@@ -188,21 +188,103 @@ export STACK_NAME="$STACK" JAIL_NAME="$STACK" KIND_NET STACK_REPOS="$REPOS" UPLO
 export STACK_READS="${READ_PAIRS# }" JAIL_READS="$(echo ${READS:-} | tr ' ' '+')"
 export GH_TOKEN GITLAB_HOST GITLAB_READ_TOKEN GITLAB_FORK_PATH GITLAB_DEPLOY_USER GITLAB_DEPLOY_TOKEN
 VOLS=(
-  -v "$STATE_DIR:/home/node/.claude"
-  -v "$SHARED_CREDS:/home/node/.claude/.credentials.json"
-  -v "$CLAUDE_JSON:/home/node/.claude.json"
+  -v "$STATE_DIR:/home/claude/.claude"
+  -v "$SHARED_CREDS:/home/claude/.claude/.credentials.json"
+  -v "$CLAUDE_JSON:/home/claude/.claude.json"
 )
 for r in $REPOS; do VOLS+=(-v "$JAIL_HOME/$STACK/$r:/workspace/$r"); done
+# Git config + hooks read-only (repo and every submodule under .git/modules): both run on the HOST
+# the next time host git or an IDE touches the repo (hooks, core.fsmonitor, core.sshCommand, filter
+# drivers), and neither shows up in a diff. Costs: no repo-config writes in the jail (`push -u`,
+# `remote add`, `branch --set-upstream-to`) — the global push.default/pushDefault cover pushing.
+for r in $REPOS; do
+  gd="$JAIL_HOME/$STACK/$r/.git"
+  [ -d "$gd" ] || { [ -e "$gd" ] && echo "⚠ $r/.git is not a directory (worktree/submodule?) — config/hooks NOT protected" >&2; continue; }
+  while IFS= read -r cfg; do
+    d="${cfg%/config}"; rel="${d#"$JAIL_HOME/$STACK/"}"
+    mkdir -p "$d/hooks"                                      # docker would create a missing source root-owned
+    VOLS+=(-v "$cfg:/workspace/$rel/config:ro" -v "$d/hooks:/workspace/$rel/hooks:ro")
+  done < <(find "$gd" -maxdepth 1 -name config -type f; [ -d "$gd/modules" ] && find "$gd/modules" -name config -type f -path '*/modules/*/config')
+done
 for pr in $READ_PAIRS; do VOLS+=(-v "$JAIL_HOME/${pr%%:*}/${pr#*:}:/reads/${pr%%:*}/${pr#*:}:ro"); done
 PORTS=(-p "127.0.0.1:$UPLOAD_PORT:8000")                       # loopback only — office/client Wi-Fi
 [ "$LOGIN" = 1 ] && PORTS+=(-p 127.0.0.1:54545:54545)
 
-rm -rf "$ERR_DIR"                                                 # exec skips the EXIT trap
-exec docker compose -f "$HERE/docker-compose.yml" run --rm \
-  "${PORTS[@]}" "${VOLS[@]}" \
+# ── the jail's network namespace: a pod, in Kubernetes terms ─────────────────────────────────────
+# A pause container owns the namespace: the networks (a per-stack bridge for egress, plus the kind
+# network) and the published ports. The jail joins it with network_mode container:<holder>, and so
+# does the dev proxy. The proxy listens on 127.0.0.1 — a namespace's loopback is reachable only
+# from processes inside that namespace, so nothing on the host, the LAN, other containers or kind
+# pods can reach it, by construction. The dev token lives only in the proxy container (own PID and
+# mount namespaces): the jail gets a credential-less kubeconfig, and the proxy refuses writes,
+# secrets, exec/attach/portforward and service/pod proxying whoever the client is.
+NETNS="jail-$STACK-net"; DEVPROXY="jail-$STACK-devproxy"; NET="jail-$STACK"
+RUN_DIR="$JAIL_HOME/.run-$STACK"; mkdir -p "$RUN_DIR"; chmod 700 "$RUN_DIR"   # dev proxy audit logs
+PAUSE_IMAGE="${PAUSE_IMAGE:-registry.k8s.io/pause:3.10}"
+KUBECTL_IMAGE="${KUBECTL_IMAGE:-registry.k8s.io/kubectl:v1.37.1}"
+SIDECAR=(--read-only --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)")
+
+cleanup() {
+  if docker container inspect "$DEVPROXY" >/dev/null 2>&1; then
+    docker logs "$DEVPROXY" > "$RUN_DIR/devproxy-$(date +%Y%m%dT%H%M%S).log" 2>&1 || true
+  fi
+  docker rm -f "$DEVPROXY" "$NETNS" >/dev/null 2>&1 || true
+  rm -f "$RUN_DIR/dev-kubeconfig"; rm -rf "$ERR_DIR"
+}
+trap cleanup EXIT
+cleanup                                                           # leftovers of a crashed launch
+
+docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
+docker run -d --rm --name "$NETNS" --network "$NET" "${PORTS[@]}" "${SIDECAR[@]}" "$PAUSE_IMAGE" >/dev/null
+if [ -n "$STACK_KUBE_TOKEN" ]; then
+  docker network connect "$KIND_NET" "$NETNS" || echo "⚠ could not join docker network '$KIND_NET' — kind unreachable" >&2
+fi
+
+STACK_DEVKUBE_PROXY=""
+if [ -n "$STACK_DEVKUBE_TOKEN" ]; then
+  # Read once at proxy start, deleted as soon as it is serving: the token is on the host disk for
+  # seconds, mode 600, readable only by the host user (which the proxy runs as).
+  ( umask 077; cat > "$RUN_DIR/dev-kubeconfig" <<EOT
+apiVersion: v1
+kind: Config
+clusters: [{ name: dev, cluster: { server: "$STACK_DEVKUBE_SERVER", certificate-authority-data: "$STACK_DEVKUBE_CA" } }]
+users:    [{ name: sa, user: { token: "$STACK_DEVKUBE_TOKEN" } }]
+contexts: [{ name: dev, context: { cluster: dev, user: sa } }]
+current-context: dev
+EOT
+  )
+  # Filters (Go regexps, comma-separated, matched on the path segment so prefixes like // or
+  # /api/v1/watch/ don't slip past). Methods: anything that is not exactly GET or HEAD — written
+  # as the complement because Go regexps have no lookahead. A configmap or service literally named
+  # "secrets"/"proxy"/"exec" is collateral; acceptable.
+  docker run -d --name "$DEVPROXY" --network "container:$NETNS" "${SIDECAR[@]}" \
+    --tmpfs /tmp -e HOME=/tmp -v "$RUN_DIR/dev-kubeconfig:/kubeconfig:ro" "$KUBECTL_IMAGE" \
+    --kubeconfig=/kubeconfig proxy --address=127.0.0.1 --port=8001 -v=6 \
+    --reject-methods='(?i)^([^gh].*|g([^e].*)?|ge([^t].*)?|get.+|h([^e].*)?|he([^a].*)?|hea([^d].*)?|head.+)$' \
+    --reject-paths='(^|/)secrets(/|$),(^|/)(exec|attach|portforward|proxy)(/|$)' >/dev/null
+  for _ in $(seq 1 50); do
+    docker logs "$DEVPROXY" 2>&1 | grep -q 'Starting to serve' && break
+    docker container inspect -f '{{.State.Running}}' "$DEVPROXY" 2>/dev/null | grep -q true || break
+    sleep 0.2
+  done
+  rm -f "$RUN_DIR/dev-kubeconfig"
+  if docker logs "$DEVPROXY" 2>&1 | grep -q 'Starting to serve'; then
+    STACK_DEVKUBE_PROXY="http://127.0.0.1:8001"
+    echo "→ dev: read-only proxy up in the jail's namespace (token stays in $DEVPROXY; audit log → $RUN_DIR/)"
+  else
+    echo "⚠ dev: proxy did not start — continuing without kdev. It said:" >&2
+    docker logs "$DEVPROXY" 2>&1 | tail -5 | sed 's/^/    /' >&2
+  fi
+fi
+unset STACK_DEVKUBE_TOKEN STACK_DEVKUBE_CA
+export STACK_DEVKUBE_PROXY JAIL_NETNS="$NETNS"
+
+# Not exec: the EXIT trap has to remove the holder + proxy (and save the proxy log) afterwards.
+docker compose -f "$HERE/docker-compose.yml" run --rm \
+  "${VOLS[@]}" \
   -e STACK_NAME -e JAIL_NAME -e JAIL_READS -e STACK_REPOS -e STACK_READS -e UPLOAD_DIR -e UPLOAD_HOST_PORT \
   -e GH_TOKEN -e GITLAB_HOST -e GITLAB_READ_TOKEN -e GITLAB_FORK_PATH -e GITLAB_DEPLOY_USER -e GITLAB_DEPLOY_TOKEN \
   -e STACK_KUBE_TOKEN -e STACK_KUBE_SERVER -e STACK_KUBE_CA -e STACK_KUBE_NS -e STACK_KUBE_SA \
-  -e STACK_DEVKUBE_TOKEN -e STACK_DEVKUBE_SERVER -e STACK_DEVKUBE_CA -e STACK_DEVKUBE_NS -e STACK_DEVKUBE_SA \
+  -e STACK_DEVKUBE_PROXY -e STACK_DEVKUBE_NS -e STACK_DEVKUBE_SA \
   stack \
   bash -c "source /workspace/tools/stack-jail-init.sh && cd /workspace/$PRIMARY && exec claude ${JAIL_CLAUDE_FLAGS:-}"

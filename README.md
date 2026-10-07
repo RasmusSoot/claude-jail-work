@@ -6,8 +6,9 @@ under whatever permission mode the account's managed policy allows.
 
 **Design rule:** tokens + git are the boundaries. A jail's credentials cannot write to an upstream
 repository or mutate a client cluster, so the container needs no command filter to be safe.
-The reasoning and the credential inventory are kept with the jail design notes (outside this repo
-until they are client-free enough to publish).
+The generic security model — boundaries vs scenery, every measure and where it lives, accepted
+risks, open items — is [docs/security.md](docs/security.md). Client-specific notes stay outside
+this repo.
 
 ## Layout on the host
 
@@ -23,7 +24,7 @@ until they are client-free enough to publish).
 ```bash
 ./setup-env.sh            # writes .env (UID/GID, JAIL_HOME), pre-creates state files
 docker compose build
-source .aliases           # or add to ~/.zshrc
+tools/pin-aliases.sh     # review + pin .aliases; ~/.zshrc sources the pinned copy (snippet in the script header)
 jail-main                 # the login jail: run /login here once (it maps the OAuth port on loopback)
 siva                      # a stack jail: tools/stack-jail.sh siva
 ```
@@ -45,9 +46,13 @@ Per stack you need: a `stacks/<name>.conf` (see `stacks/siva.conf`), the repos c
 2. Mints the kind token and, if configured, the dev token — each checked for JWT shape and for the
    expected `sub` claim before it is injected; the dev ServiceAccount is checked by impersonation first.
 3. Mounts only the client's repo dirs, the per-stack Claude state and the shared credentials file.
-4. Joins the client's kind Docker network, publishes the upload UI on a loopback port, and starts
-   `claude` with no bypass flag. `tools/stack-jail-init.sh` then builds the per-host git credential
-   store, writes `~/.kube/kind.yaml` and `~/.kube/dev.yaml`, and renders the session card.
+4. Starts the jail's network namespace like a Kubernetes pod: a pause container on a per-stack
+   bridge (+ the kind network) that publishes the upload UI on a loopback port, and, if dev is
+   configured, a `kubectl proxy` sidecar in the same namespace that holds the dev token and serves
+   read-only on `127.0.0.1:8001`. Then it starts `claude` in that namespace with no bypass flag, and
+   removes the sidecars (saving the proxy's request log) when the session ends.
+   `tools/stack-jail-init.sh` builds the per-host git credential store, writes `~/.kube/kind.yaml`
+   and a credential-less `~/.kube/dev.yaml`, and renders the session card.
 
 ## Not in this variant
 

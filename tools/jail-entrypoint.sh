@@ -26,13 +26,13 @@ if [ -z "${CLIENT_NAME:-}" ]; then
 fi
 
 # Git credential store, container-local and rebuilt each start from the env; the helper is injected
-# via GIT_CONFIG_* because /home/node/.gitconfig is a bind mount here (git config's rename would
+# via GIT_CONFIG_* because /home/claude/.gitconfig is a bind mount here (git config's rename would
 # EBUSY). Keeps tokens out of remote URLs. Client jails build their own per-host store in init.
 if [ -n "${GH_TOKEN:-}" ] && [ -z "${CLIENT_NAME:-}" ]; then
-  ( umask 077; printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > /home/node/.git-credentials )
+  ( umask 077; printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > /home/claude/.git-credentials )
   export GIT_CONFIG_COUNT=1
   export GIT_CONFIG_KEY_0=credential.helper
-  export GIT_CONFIG_VALUE_0='store --file /home/node/.git-credentials'
+  export GIT_CONFIG_VALUE_0='store --file /home/claude/.git-credentials'
 fi
 
 exec "$@"

@@ -6,7 +6,7 @@
 _sj_warn() { echo "stack-jail-init: $*" >&2; }
 
 # ── git identity + per-host credential routing ──────────────────────────────────────────────────
-[ -f /home/node/.gitconfig-base ] && cp /home/node/.gitconfig-base "$HOME/.gitconfig" || _sj_warn "no .gitconfig-base — set user.name/email"
+[ -f /home/claude/.gitconfig-base ] && cp /home/claude/.gitconfig-base "$HOME/.gitconfig" || _sj_warn "no .gitconfig-base — set user.name/email"
 git config --global credential.helper "store --file $HOME/.git-credentials"
 git config --global remote.pushDefault origin        # triangular: track upstream, push to the fork
 git config --global push.default current
@@ -46,9 +46,18 @@ if [ -n "${STACK_KUBE_TOKEN:-}" ]; then
 else
   _sj_kind="no kind token this session — plain \`kubectl\` is unavailable."
 fi
-if [ -n "${STACK_DEVKUBE_TOKEN:-}" ]; then
-  _sj_kubeconfig "$HOME/.kube/dev.yaml" client-dev "$STACK_DEVKUBE_SERVER" "$STACK_DEVKUBE_CA" "$STACK_DEVKUBE_TOKEN" "$STACK_DEVKUBE_NS" "$STACK_DEVKUBE_SA"
-  _sj_dev="READ-ONLY SA \`$STACK_DEVKUBE_SA\` in \`$STACK_DEVKUBE_NS\` (8h, verified non-mutating, no secrets). ONLY via \`kdev <verb> ...\` — never set KUBECONFIG to it."
+if [ -n "${STACK_DEVKUBE_PROXY:-}" ]; then
+  # No credential: the dev proxy sidecar (same network namespace, loopback only) holds the token,
+  # and refuses writes, secrets, exec/attach/portforward and proxying for any client.
+  cat > "$HOME/.kube/dev.yaml" <<EOT
+apiVersion: v1
+kind: Config
+clusters: [{ name: client-dev, cluster: { server: "$STACK_DEVKUBE_PROXY" } }]
+users:    [{ name: via-proxy, user: {} }]
+contexts: [{ name: client-dev, context: { cluster: client-dev, user: via-proxy, namespace: "$STACK_DEVKUBE_NS" } }]
+current-context: client-dev
+EOT
+  _sj_dev="READ-ONLY SA \`$STACK_DEVKUBE_SA\` in \`$STACK_DEVKUBE_NS\` through a proxy that holds the token (8h; GET only, no secrets, no exec). Use \`kdev <verb> ...\`."
 else
   _sj_dev="no dev credential this session — \`kdev\` is unavailable."
 fi
@@ -73,6 +82,6 @@ EOT
 } > /workspace/CLAUDE.local.md 2>/dev/null || _sj_warn "could not write /workspace/CLAUDE.local.md"
 
 unset _sj_kind _sj_dev GITLAB_DEPLOY_TOKEN GITLAB_READ_TOKEN
-unset STACK_KUBE_TOKEN STACK_KUBE_CA STACK_DEVKUBE_TOKEN STACK_DEVKUBE_CA
+unset STACK_KUBE_TOKEN STACK_KUBE_CA
 unset -f _sj_warn _sj_kubeconfig 2>/dev/null
 true

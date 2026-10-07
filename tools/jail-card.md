@@ -16,10 +16,12 @@ human pushes.
 - **git**: `upstream` remotes are fetch-only. `origin` is the human's fork and the only place any
   token here can write. Protected `main` on the fork rejects direct pushes. Code reaches upstream
   through a merge request the human opens under their own name. Add a `Co-Authored-By` trailer to
-  commits you author.
+  commits you author. In stack jails each repo's `.git/config` and `.git/hooks` are read-only, so
+  `push -u`, `remote add` and `branch --set-upstream-to` fail by design — push without `-u`.
 - **kubectl**: plain `kubectl` is the LOCAL KIND cluster (namespace-admin, disposable — destructive
-  verbs are fine there). `kdev` is the CLIENT DEV cluster, read-only by three layers; it refuses
-  mutating verbs and secrets. Never set `KUBECONFIG` by hand, never `use-context`, never merge the
+  verbs are fine there). `kdev` is the CLIENT DEV cluster, read-only through a proxy that holds the
+  token (no credential is in this jail); anything but GET, secrets, exec and port-forward get 403.
+  `kdev auth can-i` does not work (it is a POST). Never set `KUBECONFIG` by hand, never `use-context`, never merge the
   two files. Every `kdev` call prints its cluster banner — read it.
 - **No client fact in any repo**: CIDRs, hostnames, ServiceAccount names, the GitLab URL — these
   live in the human's gitignored env file. Charts and configs you write come from public sources
@@ -29,11 +31,13 @@ human pushes.
 
 ## Environment
 
-- Container base: `node:22-bookworm`, running as `node` remapped to the host UID/GID; no sudo.
+- Container base: `debian:trixie` with only the jail's own needs (git, python3, jq, curl, procps);
+  runs as `claude` with the host UID/GID; no sudo. No node, kubectl or gh in the image — use the
+  repo's devbox (`devbox run …`).
 - **Project tooling is Devbox/Nix, not apt.** `/nix` is a jail-only store (Docker volume shared by
   all jails, never the host's), so `devbox install` / `devbox run` work here directly; the same
   committed `devbox.json` works on the host against the host's own store.
-- Memory and session history persist at `/home/node/.claude` (bind-mounted per stack).
+- Memory and session history persist at `/home/claude/.claude` (bind-mounted per stack).
 - A stack may declare `READS`: other stacks' repo dirs mounted read-only under `/reads/<stack>/<repo>`.
   They are views, not workspaces — no tokens for them, no commits in them.
 - Published ports are loopback-only on the host; the upload server at `${UPLOAD_DIR}` needs the per-session token printed at launch — never echo or log that URL.

@@ -19,17 +19,19 @@ services:
       OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,jail.name=${JAIL_NAME:-main}
     volumes:
       - .:/workspace
-      - ${JAIL_HOME}/.claude-data:/home/node/.claude
+      - ${JAIL_HOME}/.claude-data:/home/claude/.claude
       # Single-file overlay on top of the dir mount: on a file mountpoint the CLI's atomic rename
       # fails (EBUSY) and it falls back to an in-place write, so the host inode never changes and
       # every stack jail (pinned to that inode by its own file mount) sees token refreshes.
-      - ${JAIL_HOME}/.claude-data/.credentials.json:/home/node/.claude/.credentials.json
-      - ${JAIL_HOME}/.claude-data.json:/home/node/.claude.json
+      - ${JAIL_HOME}/.claude-data/.credentials.json:/home/claude/.claude/.credentials.json
+      - ${JAIL_HOME}/.claude-data.json:/home/claude/.claude.json
       # Jail-only git identity; the host ~/.gitconfig is deliberately NOT mounted.
-      - ${JAIL_HOME}/.claude-data.gitconfig:/home/node/.gitconfig
+      - ${JAIL_HOME}/.claude-data.gitconfig:/home/claude/.gitconfig
       # Jail-only Nix store (named volume, seeded from the image) — never the host's /nix.
       - jail-nix:/nix
     # No ports: here on purpose — aliases publish them, loopback only.
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     stdin_open: true
     tty: true
     env_file:
@@ -40,7 +42,8 @@ services:
   # Never `docker compose run stack` directly. Differences from `claude` on purpose:
   #   - no repo mount of this repo except tools/ (read-only): the upload server, init, kdev
   #   - per-stack ~/.claude state; only the credentials file crosses over from the login jail
-  #   - joins the client's kind Docker network so the API server is reachable by container name
+  #   - no networks of its own: it joins the namespace of a pause container the launcher starts
+  #     (per-stack bridge + kind network + published ports), shared with the dev proxy sidecar
   stack:
     build:
       context: .
@@ -55,9 +58,11 @@ services:
       OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,jail.name=${JAIL_NAME:-stack},jail.reads=${JAIL_READS:-none}
     volumes:
       - ./tools:/workspace/tools:ro
-      - ${JAIL_HOME}/.claude-data.gitconfig:/home/node/.gitconfig-base:ro
+      - ${JAIL_HOME}/.claude-data.gitconfig:/home/claude/.gitconfig-base:ro
       - jail-nix:/nix
-    networks: [default, kind]
+    network_mode: "container:${JAIL_NETNS:-launch-via-tools-stack-jail-sh}"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     stdin_open: true
     tty: true
 
@@ -66,7 +71,3 @@ volumes:
   # the next start re-seeds it from the image.
   jail-nix:
 
-networks:
-  kind:
-    external: true
-    name: ${KIND_NET:-kind}
