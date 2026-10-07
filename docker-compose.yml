@@ -59,7 +59,7 @@ services:
     volumes:
       - ./tools:/workspace/tools:ro
       - ${JAIL_HOME}/.claude-data.gitconfig:/home/claude/.gitconfig-base:ro
-      - jail-nix:/nix
+      - jail-nix-stack:/nix               # one store PER STACK: a jail must not tamper with another client's tools
     network_mode: "container:${JAIL_NETNS:-launch-via-tools-stack-jail-sh}"
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -67,7 +67,10 @@ services:
     tty: true
 
 volumes:
-  # Shared by every jail (login + stacks), isolated from the host. `docker volume rm` it to reset;
-  # the next start re-seeds it from the image.
+  # Jail-only Nix stores, isolated from the host and from each other: one for the login jail, one per
+  # stack (docker volume `jail-nix-<stack>`). `docker volume rm` one to reset it; the next start
+  # re-seeds it from the image.
   jail-nix:
+  jail-nix-stack:
+    name: jail-nix-${STACK_NAME:-unset}
 

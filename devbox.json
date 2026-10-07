@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.2/.schema/devbox.schema.json",
+  "packages": [
+    "kubectl@1.33.4",
+    "kind@0.29.0",
+    "gh@2.98.0"
+  ],
+  "shell": {
+    "init_hook": []
+  }
+}

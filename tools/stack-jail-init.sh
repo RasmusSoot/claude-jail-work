@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # stack-jail-init — sourced (bash) inside a per-stack jail before exec'ing claude.
 # Consumes the env tools/stack-jail.sh injects. Everything here is container-local session state
 # (credential store, kubeconfig files, session card); nothing persists but ~/.claude.
@@ -6,15 +7,18 @@
 _sj_warn() { echo "stack-jail-init: $*" >&2; }
 
 # ── git identity + per-host credential routing ──────────────────────────────────────────────────
-[ -f /home/claude/.gitconfig-base ] && cp /home/claude/.gitconfig-base "$HOME/.gitconfig" || _sj_warn "no .gitconfig-base — set user.name/email"
+if [ -f /home/claude/.gitconfig-base ]; then cp /home/claude/.gitconfig-base "$HOME/.gitconfig"; else _sj_warn "no .gitconfig-base — set user.name/email"; fi
 git config --global credential.helper "store --file $HOME/.git-credentials"
 git config --global remote.pushDefault origin        # triangular: track upstream, push to the fork
 git config --global push.default current
 : > "$HOME/.git-credentials"; chmod 600 "$HOME/.git-credentials"
 # github.com: ONE entry — the fork-org token. Its reach is set by GitHub (the org's repos), not by path;
 # it also authenticates reads of public upstreams (rate limits), and cannot write outside the org.
-[ -n "${GH_TOKEN:-}" ] && printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" >> "$HOME/.git-credentials" \
-  || _sj_warn "GH_TOKEN empty — GitHub pushes/gh will not work"
+if [ -n "${GH_TOKEN:-}" ]; then
+  printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" >> "$HOME/.git-credentials"
+else
+  _sj_warn "GH_TOKEN empty — GitHub pushes/gh will not work"
+fi
 # GitLab: path-specific deploy token FIRST (store returns the first match), host-wide read token after.
 if [ -n "${GITLAB_HOST:-}" ]; then
   git config --global "credential.https://$GITLAB_HOST.useHttpPath" true
@@ -74,7 +78,8 @@ export PATH="/workspace/tools:$PATH"                   # kdev
 - **git**: \`upstream\` is fetch-only; \`origin\` is YOUR fork and the only place any token here can write. GitHub token present: $([ -n "${GH_TOKEN:-}" ] && echo yes || echo no). GitLab deploy token present: $([ -n "${GITLAB_DEPLOY_TOKEN:-}" ] && echo yes || echo no). Pushes are the human's (\`! git push\`); add a Co-Authored-By trailer to commits you author.
 - **kubectl (kind)**: ${_sj_kind}
 - **kdev (client dev)**: ${_sj_dev}
-- **uploads**: files dropped via the upload UI land in \`${UPLOAD_DIR:-/workspace/uploads}\` (gitignored inbox).
+- **notes**: \`/workspace/notes\` — the human's and agents' shared, persistent notes for this stack. Never committed to any repo or published; client facts are fine here. A local git repo with no remote: the launcher snapshots it before and after each session, so whatever you write is reviewed. Read it at the start of non-trivial work; write things meant to outlast this session.
+- **uploads**: files dropped via the upload UI land in \`${UPLOAD_DIR:-/workspace/notes/uploads}\` (gitignored inbox, outside every repo).
 
 ---
 EOT

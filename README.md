@@ -15,22 +15,45 @@ this repo.
 ```
 ~/claude/claude-jail-work/          this repo (the mechanism)
 ~/claude/jail/<stack>/<repo>/       per-stack workspaces — each repo: `upstream` fetch-only, `origin` = your fork
-~/claude/jail/.env.<stack>         tokens + client FACTS (gitignored, chmod 600; created on first launch)
+~/claude/jail/<stack>/notes/        shared notes + upload inbox: local git, no remote, never published
+~/claude/jail/.env.<stack>          tokens + client FACTS (outside any repo, mode 600; tools/stack-env.sh)
 ~/claude/jail/.claude-data*         Claude state: shared login + per-stack memory/history
+~/claude/jail/.run-<stack>/         dev proxy request logs, one per session
 ```
 
 ## Bootstrap
 
+Host prerequisites: Docker with the compose plugin, devbox, and `gh` logged in (for
+`stack-fork.sh`). The host-side scripts take `kubectl`, `kind` and `gh` from this repo's
+`devbox.json` (exact pins, via `tools/host-tools.sh`), not from whatever the host has installed.
+
+Once per machine:
+
 ```bash
-./setup-env.sh            # writes .env (UID/GID, JAIL_HOME), pre-creates state files
+./setup-env.sh                  # .env (UID/GID, JAIL_HOME), state files, jail gitconfig template
 docker compose build
-tools/pin-aliases.sh     # review + pin .aliases; ~/.zshrc sources the pinned copy (snippet in the script header)
-jail-main                 # the login jail: run /login here once (it maps the OAuth port on loopback)
-siva                      # a stack jail: tools/stack-jail.sh siva
+tools/pin-aliases.sh            # review + pin .aliases, then add the ~/.zshrc snippet from the
+                                # script header and open a new shell
+jail-main                       # the login jail: /login once (it maps the OAuth port on loopback)
 ```
 
-Per stack you need: a `stacks/<name>.conf` (see `stacks/siva.conf`), the repos cloned under
-`~/claude/jail/<name>/`, and the env file filled in. Identities, by design:
+Fill in `~/claude/jail/.claude-data.gitconfig` (the jail's git identity) while you are at it.
+
+Per stack (`siva` as the example):
+
+```bash
+tools/stack-env.sh siva         # creates ~/claude/jail/.env.siva (mode 600) — fill it in
+tools/stack-fork.sh siva        # fork into FORK_ORG, clone from UPSTREAM_OWNER, wire remotes
+siva                            # the stack jail (alias for tools/stack-jail.sh siva)
+devbox install                  # inside the jail, once: each stack has its own Nix store
+```
+
+A stack needs a `stacks/<name>.conf` (see `stacks/siva.conf`) and an alias line in `.aliases`
+(then `jail-pin`). `stack-fork.sh` is idempotent: re-run it after adding a repo to `REPOS` —
+remotes can't be changed inside a jail. For a kind cluster, the stack's namespace, ServiceAccount
+and RoleBinding come from your lab setup, and the namespace must carry
+`pod-security.kubernetes.io/enforce: baseline` (or `restricted`), or the launcher withholds the kind
+token. Identities, by design:
 
 | Purpose | Credential | Reach |
 |---|---|---|
@@ -38,14 +61,18 @@ Per stack you need: a `stacks/<name>.conf` (see `stacks/siva.conf`), the repos c
 | Client GitLab, read | personal token, `read_repository` | fetch upstream |
 | Client GitLab, write | deploy token, `write_repository`, on YOUR fork inside the client's GitLab, protected `main` | that fork's unprotected branches |
 | Local kind | namespace-admin ServiceAccount, minted per launch, 8 h | one namespace, plain `kubectl` |
-| Client dev cluster | read-only ServiceAccount, minted per launch after impersonation proves it cannot mutate or read secrets, 8 h | `kdev` only |
+| Client dev cluster | read-only ServiceAccount, minted per launch after impersonation proves it cannot mutate or read secrets, 8 h; held by a proxy sidecar, never by the jail | GET through the proxy (`kdev`) |
 
 ## What the launcher does (`tools/stack-jail.sh`)
 
-1. Reads `stacks/<stack>.conf` and `~/claude/jail/.env.<stack>`; refuses to continue without the shared login file.
-2. Mints the kind token and, if configured, the dev token — each checked for JWT shape and for the
-   expected `sub` claim before it is injected; the dev ServiceAccount is checked by impersonation first.
-3. Mounts only the client's repo dirs, the per-stack Claude state and the shared credentials file.
+1. Reads `stacks/<stack>.conf` and `~/claude/jail/.env.<stack>`; refuses to continue without the
+   shared login file or the primary repo.
+2. Mints the kind token (only if the namespace enforces Pod Security `baseline`/`restricted` and the
+   SA can't undo that) and, if configured, the dev token (only if the SA's full permission list is
+   read-only and secret-free) — each checked for JWT shape and the expected `sub` claim.
+3. Mounts only the stack's repo dirs, its `notes/` and the per-stack Claude state, with each repo's
+   `.git/config`, `.git/hooks` and `.git/commondir` read-only. Snapshots `notes/` (local git) and
+   audits the repos for planted nested repositories before the session and again after it.
 4. Starts the jail's network namespace like a Kubernetes pod: a pause container on a per-stack
    bridge (+ the kind network) that publishes the upload UI on a loopback port, and, if dev is
    configured, a `kubectl proxy` sidecar in the same namespace that holds the dev token and serves
@@ -57,4 +84,5 @@ Per stack you need: a `stacks/<name>.conf` (see `stacks/siva.conf`), the repos c
 ## Not in this variant
 
 Passwordless sudo, the Docker socket, host kubeconfig or SSH keys, cross-jail handoff channels,
-and any OpenRouter / OpenCode routing. Image builds and pushes happen in CI or by the human.
+and any OpenRouter / OpenCode routing. The image is built on the host (`docker compose build`);
+pushes are the human's.

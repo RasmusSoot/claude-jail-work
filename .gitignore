@@ -11,10 +11,13 @@
 # composed session card (written at container start)
 /CLAUDE.local.md
 
-# upload server inbox (login jail)
+# login jail inbox: uploads AND the private design notes (DESIGN.md) — must stay ignored
 /uploads/
 
 # IDE / python
 .idea/
 __pycache__/
 *.pyc
+
+# devbox profile (host tool pins; devbox.lock is committed)
+.devbox/

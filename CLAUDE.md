@@ -8,12 +8,18 @@ Derived from the home variant (`upstream`, fetch-only); cherry-pick in either di
 
 - `Dockerfile` + `docker-compose.yml`: one image, two services — `claude` (the **login/mechanism
   jail**: only this repo mounted; the one session that maps the OAuth port) and `stack` (the
-  **per-stack jail**: scoped repo mounts, per-stack tokens, two minted kubeconfig files;
-  launcher `tools/stack-jail.sh`, in-container init `tools/stack-jail-init.sh`).
+  **per-stack jail**: scoped repo mounts + `notes/`, per-stack tokens, a kind kubeconfig and a
+  credential-less dev kubeconfig served by a proxy sidecar; launcher `tools/stack-jail.sh`,
+  in-container init `tools/stack-jail-init.sh`).
 - `stacks/<name>.conf`: what a stack jail mounts — generic by rule (repo dir names, primary dir,
   kind cluster, a host port). Client FACTS never go here; they live in `~/claude/jail/.env.<name>`.
-- `tools/kdev`: the read-only wrapper for the client dev cluster. `tools/upload/`: the file-drop
-  server. `.aliases`: host launch shortcuts, loopback-only ports.
+- Host-side scripts: `tools/stack-env.sh` (env file template), `tools/stack-fork.sh` (fork, clone,
+  remotes), `tools/pin-aliases.sh` (`jail-pin`). Those that call `kubectl`/`kind`/`gh` take them
+  from this repo's `devbox.json` via `tools/host-tools.sh`. `.aliases`: host launch shortcuts,
+  loopback-only ports.
+- In-jail: `tools/kdev` (the dev cluster wrapper), `tools/statusline.sh`, `tools/upload/` (the
+  file-drop server).
+- `docs/security.md`: the security model — what is a boundary, what is scenery, what is accepted.
 
 ## Hard rules
 

@@ -16,15 +16,18 @@
 #     for fetching upstream. No token in a jail can write to an upstream repo.
 #   - kubectl: TWO kubeconfig FILES, minted here per launch from the host credential, 8h:
 #     kind.yaml = namespace-admin workbench SA on the local kind cluster (plain `kubectl`);
-#     dev.yaml  = READ-ONLY SA on the client dev cluster, reachable only through tools/kdev,
-#     and only installed after impersonation proves it cannot mutate or read secrets.
-#   - filesystem: only $JAIL_HOME/<stack>/<repo> dirs are mounted. No ~/.kube, no ~/.ssh,
-#     no Docker socket.
+#     dev.yaml  = NO credential: points at a kubectl-proxy sidecar in the jail's network namespace
+#     that holds the READ-ONLY SA token (minted only after impersonation proves it cannot mutate
+#     or read secrets) and refuses writes, secrets and exec itself.
+#   - filesystem: only $JAIL_HOME/<stack>/<repo> dirs and $JAIL_HOME/<stack>/notes are mounted, with
+#     each repo's git internals read-only. No ~/.kube, no ~/.ssh, no Docker socket.
 # Pushes are human (`! git push` or from the host) under the managed policy; the launcher never
 # passes a permission-bypass flag. JAIL_CLAUDE_FLAGS exists for the day an exception is granted.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"           # this repo (the mechanism)
+# shellcheck source=tools/host-tools.sh
+. "$HERE/tools/host-tools.sh"                        # kubectl/kind/gh pinned by this repo's devbox.json
 JAIL_HOME="${JAIL_HOME:-$HOME/claude/jail}"         # per-stack workspaces live here
 STACK="${1:-}"; shift || true
 LOGIN=0; [ "${1:-}" = "--login" ] && LOGIN=1
@@ -35,6 +38,7 @@ CONF="$HERE/stacks/$STACK.conf"
 # shellcheck source=/dev/null
 . "$CONF"
 : "${REPOS:?stacks/$STACK.conf must set REPOS}" "${PRIMARY:?must set PRIMARY}" "${UPLOAD_PORT:?must set UPLOAD_PORT}"
+for r in $REPOS; do [ "$r" != notes ] || { echo "FATAL: stacks/$STACK.conf lists a repo named 'notes' — that name is the stack's notes dir" >&2; exit 2; }; done
 KIND_CLUSTER="${KIND_CLUSTER-$STACK}"               # conf may set KIND_CLUSTER="" = no kind for this stack
 KIND_NET="${KIND_NET:-kind}"                        # docker network the kind nodes sit on
 KIND_NS="${KIND_NS:-$STACK}"
@@ -48,40 +52,25 @@ SHARED_CREDS="$JAIL_HOME/.claude-data/.credentials.json"   # login once via `jai
 mkdir -p "$STATE_DIR" "$JAIL_HOME/$STACK"
 [ -s "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
 for r in $REPOS; do
-  [ -d "$JAIL_HOME/$STACK/$r" ] || echo "⚠ $JAIL_HOME/$STACK/$r missing — clone it first (upstream fetch-only, origin = your fork)" >&2
+  [ -d "$JAIL_HOME/$STACK/$r" ] || echo "⚠ $JAIL_HOME/$STACK/$r missing — run tools/stack-fork.sh $STACK first" >&2
 done
+[ -d "$JAIL_HOME/$STACK/$PRIMARY" ] || { echo "FATAL: the primary repo $PRIMARY is missing — run tools/stack-fork.sh $STACK" >&2; exit 2; }
 # READ-ONLY views of other stacks: "<stack>:<repo>" pairs, resolved from each stack's own conf.
 READ_PAIRS=""
 for rs in ${READS:-}; do
   [ "$rs" != "$STACK" ] || continue
   [ -f "$HERE/stacks/$rs.conf" ] || { echo "⚠ READS: stacks/$rs.conf missing — skipping $rs" >&2; continue; }
+  # shellcheck source=/dev/null
   for r in $(. "$HERE/stacks/$rs.conf" && echo "$REPOS"); do
     [ -d "$JAIL_HOME/$rs/$r" ] && READ_PAIRS="$READ_PAIRS $rs:$r" || echo "⚠ READS: $JAIL_HOME/$rs/$r missing — skipping" >&2
   done
 done
 
-if [ ! -f "$ENV_FILE" ]; then
-  cat > "$ENV_FILE" <<EOT
-# $STACK jail — tokens + client FACTS. Gitignored; never copy values into any repo.
-# GitHub: fine-grained PAT, resource owner = your trust-domain org, All repositories,
-#   Contents R/W + Metadata, NO Pull requests. Reaches only the forks.
-GH_TOKEN=
-# Client GitLab (optional). READ token: personal PAT with read_repository only.
-# WRITE: a deploy token with write_repository on YOUR personal fork inside the client's GitLab.
-GITLAB_HOST=
-GITLAB_READ_TOKEN=
-GITLAB_FORK_PATH=            # e.g. group/you/iac-fork  (the path the deploy token is scoped to)
-GITLAB_DEPLOY_USER=
-GITLAB_DEPLOY_TOKEN=
-# Client dev cluster (optional): HOST kubeconfig context + the read-only SA to mint from.
-DEV_KUBE_CONTEXT=
-DEV_KUBE_NS=
-DEV_KUBE_SA=
-EOT
-  chmod 600 "$ENV_FILE"
-  echo "→ created $ENV_FILE — fill it in, then re-run. Continuing without git/dev credentials." >&2
-fi
-set -a; . "$ENV_FILE"; set +a
+"$HERE/tools/stack-env.sh" "$STACK" >/dev/null || exit 2          # creates the env template if missing
+set -a
+# shellcheck source=/dev/null
+. "$ENV_FILE"
+set +a
 
 # Bootstrap the per-stack Claude config from the login jail's solved state (onboarding, theme)
 # — once; per-stack overrides then stick. statusLine is pinned on EVERY launch: it lives in this
@@ -96,6 +85,7 @@ s["statusLine"] = {"type": "command", "command": "/workspace/tools/statusline.sh
 json.dump(s, open(dst, "w"), indent=2)
 PY
 TRUST_DIRS=""; for r in $REPOS; do TRUST_DIRS="$TRUST_DIRS /workspace/$r"; done
+# shellcheck disable=SC2086  # TRUST_DIRS is a space-separated list: one argv entry per dir
 python3 - "$CLAUDE_JSON" "$JAIL_HOME/.claude-data.json" $TRUST_DIRS <<'PY'
 import json, os, sys
 target, main_path, dirs = sys.argv[1], sys.argv[2], sys.argv[3:]
@@ -118,10 +108,37 @@ jwt_sub() { # decode the JWT payload locally (base64url + padding) and print .su
 }
 
 # ── kind: namespace-admin workbench SA, 8h, server = in-network control-plane name ──────────────
+# kind nodes are PRIVILEGED containers: a namespace admin who may run a privileged / hostPath /
+# hostPID pod is root on the node and, through it, likely on the host. So before minting, the
+# namespace must enforce Pod Security baseline or restricted (both forbid those pods), and the SA
+# must not be able to take that away: no patch/update/delete of its namespace, no creating
+# namespaces (a fresh one would have no label), no creating pods anywhere else. The label itself
+# is set where the SA and RoleBinding are (the lab repo):
+#   pod-security.kubernetes.io/enforce: baseline     # or restricted
+kind_psa_gate() {
+  local kk=(kubectl --context "kind-$KIND_CLUSTER") as="system:serviceaccount:$KIND_NS:$KIND_SA" psa bad=""
+  psa=$("${kk[@]}" get ns "$KIND_NS" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null) || psa=""
+  case "$psa" in
+    baseline|restricted) ;;
+    *) echo "ABORT kind: namespace $KIND_NS has pod-security.kubernetes.io/enforce='${psa:-<unset>}' — needs baseline or restricted" >&2; return 1 ;;
+  esac
+  for v in patch update delete; do
+    [ "$("${kk[@]}" auth can-i "$v" "namespace/$KIND_NS" --as="$as" 2>/dev/null)" = no ] || bad="$bad $v-namespace/$KIND_NS"
+  done
+  [ "$("${kk[@]}" auth can-i create namespaces --as="$as" 2>/dev/null)" = no ] || bad="$bad create-namespaces"
+  [ "$("${kk[@]}" auth can-i create pods --all-namespaces --as="$as" 2>/dev/null)" = no ] || bad="$bad create-pods-cluster-wide"
+  [ -z "$bad" ] || { echo "ABORT kind: $KIND_SA could undo the Pod Security label:$bad" >&2; return 1; }
+  echo "→ kind: namespace $KIND_NS enforces Pod Security '$psa'; $KIND_SA cannot change it"
+}
+
 STACK_KUBE_TOKEN="" STACK_KUBE_SERVER="" STACK_KUBE_CA=""
 if [ -z "$KIND_CLUSTER" ]; then
   echo "→ kind: none declared for $STACK — plain kubectl unavailable this session"
-elif kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
+elif ! kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
+  echo "⚠ kind cluster '$KIND_CLUSTER' not found — continuing without kind kubectl" >&2
+elif ! kind_psa_gate; then
+  echo "⚠ kind: Pod Security gate failed — kind token NOT minted (see above)" >&2
+else
   if tok=$(kubectl --context "kind-$KIND_CLUSTER" -n "$KIND_NS" create token "$KIND_SA" --duration=8h 2>"$ERR_DIR/kind-mint.err" | tr -d '[:space:]'); then
     if is_jwt "$tok" && [ "$(jwt_sub "$tok")" = "system:serviceaccount:$KIND_NS:$KIND_SA" ]; then
       STACK_KUBE_TOKEN="$tok"
@@ -137,8 +154,6 @@ elif kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
     echo "⚠ kind: could not mint token for $KIND_SA@$KIND_NS (create the SA + RoleBinding in the lab repo). kubectl said:" >&2
     sed 's/^/    /' "$ERR_DIR/kind-mint.err" >&2
   fi
-else
-  echo "⚠ kind cluster '$KIND_CLUSTER' not found — continuing without kind kubectl" >&2
 fi
 
 # ── client dev: READ-ONLY SA, proven by impersonation BEFORE minting, 8h ────────────────────────
@@ -169,7 +184,9 @@ if [ -n "${DEV_KUBE_CONTEXT:-}" ] && [ -n "${DEV_KUBE_NS:-}" ] && [ -n "${DEV_KU
     if tok=$(k -n "$DEV_KUBE_NS" create token "$DEV_KUBE_SA" --duration=8h 2>"$ERR_DIR/dev-mint.err" | tr -d '[:space:]') \
        && is_jwt "$tok" && [ "$(jwt_sub "$tok")" = "$as" ]; then
       STACK_DEVKUBE_TOKEN="$tok"
-      STACK_DEVKUBE_SERVER=$(k config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
+      # DEV_KUBE_SERVER: the API as the proxy container reaches it, when that differs from the host
+      # context's view (e.g. kind as a dev stand-in: https://<cluster>-control-plane:6443).
+      STACK_DEVKUBE_SERVER=${DEV_KUBE_SERVER:-$(k config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')}
       STACK_DEVKUBE_CA=$(k config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
       echo "→ dev: minted 8h READ-ONLY token for $DEV_KUBE_SA@$DEV_KUBE_NS (subject verified)"
     else
@@ -184,28 +201,97 @@ export STACK_DEVKUBE_NS="${DEV_KUBE_NS:-}" STACK_DEVKUBE_SA="${DEV_KUBE_SA:-}"  
 
 [ -f "$SHARED_CREDS" ] || { echo "⚠ $SHARED_CREDS missing — log in once via \`jail-main\` first" >&2; exit 1; }
 
-export STACK_NAME="$STACK" JAIL_NAME="$STACK" KIND_NET STACK_REPOS="$REPOS" UPLOAD_DIR="/workspace/$PRIMARY/uploads" UPLOAD_HOST_PORT="$UPLOAD_PORT"
-export STACK_READS="${READ_PAIRS# }" JAIL_READS="$(echo ${READS:-} | tr ' ' '+')"
+export STACK_NAME="$STACK" JAIL_NAME="$STACK" KIND_NET STACK_REPOS="$REPOS" UPLOAD_DIR="/workspace/notes/uploads" UPLOAD_HOST_PORT="$UPLOAD_PORT"
+# shellcheck disable=SC2086  # unquoted on purpose: echo squeezes the list's whitespace
+JAIL_READS="$(echo ${READS:-} | tr ' ' '+')"
+export STACK_READS="${READ_PAIRS# }" JAIL_READS
 export GH_TOKEN GITLAB_HOST GITLAB_READ_TOKEN GITLAB_FORK_PATH GITLAB_DEPLOY_USER GITLAB_DEPLOY_TOKEN
 VOLS=(
   -v "$STATE_DIR:/home/claude/.claude"
   -v "$SHARED_CREDS:/home/claude/.claude/.credentials.json"
   -v "$CLAUDE_JSON:/home/claude/.claude.json"
 )
-for r in $REPOS; do VOLS+=(-v "$JAIL_HOME/$STACK/$r:/workspace/$r"); done
-# Git config + hooks read-only (repo and every submodule under .git/modules): both run on the HOST
-# the next time host git or an IDE touches the repo (hooks, core.fsmonitor, core.sshCommand, filter
-# drivers), and neither shows up in a diff. Costs: no repo-config writes in the jail (`push -u`,
-# `remote add`, `branch --set-upstream-to`) — the global push.default/pushDefault cover pushing.
-for r in $REPOS; do
+# Missing repos are skipped, not mounted: docker would create the source dir root-owned on the host.
+for r in $REPOS; do [ -d "$JAIL_HOME/$STACK/$r" ] && VOLS+=(-v "$JAIL_HOME/$STACK/$r:/workspace/$r"); done
+# Notes: a per-stack dir next to the repos, for things to share with agents and keep, but never
+# commit or publish (client facts are fine — it never leaves this machine). A local git repo with
+# no remote, so every session's changes are reviewable: the launcher commits a snapshot before and
+# after each session (`git -C ~/claude/jail/<stack>/notes log -p`). uploads/ is the upload server's
+# inbox — gitignored, and outside every client repo.
+NOTES="$JAIL_HOME/$STACK/notes"
+notes_git() { # hardened host-side git: explicit GIT_DIR/GIT_COMMON_DIR ignore a planted commondir,
+              # -c overrides neutralise fsmonitor/hooks, no host or system config is read
+  GIT_DIR="$NOTES/.git" GIT_COMMON_DIR="$NOTES/.git" GIT_WORK_TREE="$NOTES" \
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+  git -c core.fsmonitor= -c core.hooksPath=/dev/null -c commit.gpgsign=false \
+      -c user.name=stack-jail -c user.email=stack-jail@localhost "$@"
+}
+notes_snapshot() { # <message>
+  [ -d "$NOTES/.git" ] || return 0
+  notes_git add -A >/dev/null 2>&1 || return 0
+  notes_git diff --cached --quiet 2>/dev/null || notes_git commit -q -m "$1" >/dev/null 2>&1 || true
+}
+if [ ! -d "$NOTES/.git" ]; then
+  mkdir -p "$NOTES/uploads"
+  printf '/uploads/\n' > "$NOTES/.gitignore"
+  printf '# %s notes\n\nShared with every %s jail session, never committed to any repo or published.\n' "$STACK" "$STACK" > "$NOTES/README.md"
+  notes_git init -q && notes_snapshot "notes: start"
+  echo "→ notes: created $NOTES (local git, no remote)"
+fi
+mkdir -p "$NOTES/uploads"
+notes_snapshot "before session $(date +%F\ %T)"
+VOLS+=(-v "$NOTES:/workspace/notes")
+
+# Git internals read-only (repo, every submodule under .git/modules, and notes): config, hooks and
+# commondir all decide what HOST git runs the next time it — or an IDE sharing the working tree —
+# touches the repo (hooks, core.fsmonitor, core.sshCommand, filter drivers), and none shows up in a
+# diff. commondir is the subtle one: a gitdir may contain a file redirecting where config is read
+# from. A normal clone has none; "." means "this gitdir", which is the same thing — so the launcher
+# writes "." on the host and mounts it read-only, and the jail can neither create nor change it.
+# Costs: no repo-config writes in the jail (`push -u`, `remote add`, `branch --set-upstream-to`).
+GITDIRS=()
+for r in $REPOS notes; do
   gd="$JAIL_HOME/$STACK/$r/.git"
-  [ -d "$gd" ] || { [ -e "$gd" ] && echo "⚠ $r/.git is not a directory (worktree/submodule?) — config/hooks NOT protected" >&2; continue; }
+  [ -d "$gd" ] || { [ -e "$gd" ] && echo "⚠ $r/.git is not a directory (worktree/submodule?) — git internals NOT protected" >&2; continue; }
   while IFS= read -r cfg; do
     d="${cfg%/config}"; rel="${d#"$JAIL_HOME/$STACK/"}"
+    if [ -e "$d/commondir" ] && [ "$(cat "$d/commondir")" != "." ]; then
+      echo "FATAL: $d/commondir points to '$(cat "$d/commondir")' — not a normal clone, or tampered with. Inspect it before launching." >&2; exit 2
+    fi
+    printf '.\n' > "$d/commondir"
     mkdir -p "$d/hooks"                                      # docker would create a missing source root-owned
-    VOLS+=(-v "$cfg:/workspace/$rel/config:ro" -v "$d/hooks:/workspace/$rel/hooks:ro")
+    VOLS+=(-v "$cfg:/workspace/$rel/config:ro" -v "$d/hooks:/workspace/$rel/hooks:ro" -v "$d/commondir:/workspace/$rel/commondir:ro")
+    GITDIRS+=("$d")
   done < <(find "$gd" -maxdepth 1 -name config -type f; [ -d "$gd/modules" ] && find "$gd/modules" -name config -type f -path '*/modules/*/config')
 done
+
+# What mounts cannot cover, checked on the host at start and exit: a nested repository planted in
+# a working tree (IDEs auto-detect those and run git in them, with THEIR config), and the files git
+# would only use for linked worktrees or per-worktree config. Warn loudly; deleting is the human's call.
+own_submodule() { # <.git entry> <repo gitdir>: a .git FILE whose gitdir is inside <repo gitdir>/modules/
+  local target real mods
+  [ -f "$1" ] || return 1
+  target=$(sed -n 's/^gitdir: //p' "$1"); [ -n "$target" ] || return 1
+  real=$(cd "$(dirname "$1")" && cd "$target" 2>/dev/null && pwd -P) || return 1
+  mods=$(cd "$2" && pwd -P)/modules/
+  case "$real/" in "$mods"*) return 0;; *) return 1;; esac
+}
+audit_repos() { # <when>
+  local r d hits=""
+  for r in $REPOS notes; do
+    [ -d "$JAIL_HOME/$STACK/$r/.git" ] || continue
+    while IFS= read -r d; do
+      own_submodule "$d" "$JAIL_HOME/$STACK/$r/.git" || hits="$hits\n    nested repo: $d"
+    done < <(find "$JAIL_HOME/$STACK/$r" -mindepth 1 \( -path "$JAIL_HOME/$STACK/$r/.git" -prune \) -o \( -name .git -print -prune \) 2>/dev/null)
+  done
+  for d in ${GITDIRS[@]+"${GITDIRS[@]}"}; do                # bash 3.2 (macOS) + set -u: empty-array safe
+    [ "$(cat "$d/commondir" 2>/dev/null)" = "." ] || hits="$hits\n    commondir changed: $d/commondir"
+    [ ! -e "$d/config.worktree" ] || hits="$hits\n    per-worktree config: $d/config.worktree"
+    [ ! -d "$d/worktrees" ] || hits="$hits\n    linked worktrees: $d/worktrees/ (yours?)"
+  done
+  [ -z "$hits" ] || printf '⚠ git audit (%s) — do NOT run git or open these in an IDE until inspected:%b\n' "$1" "$hits" >&2
+}
+audit_repos "before session"
 for pr in $READ_PAIRS; do VOLS+=(-v "$JAIL_HOME/${pr%%:*}/${pr#*:}:/reads/${pr%%:*}/${pr#*:}:ro"); done
 PORTS=(-p "127.0.0.1:$UPLOAD_PORT:8000")                       # loopback only — office/client Wi-Fi
 [ "$LOGIN" = 1 ] && PORTS+=(-p 127.0.0.1:54545:54545)
@@ -231,12 +317,13 @@ cleanup() {
   docker rm -f "$DEVPROXY" "$NETNS" >/dev/null 2>&1 || true
   rm -f "$RUN_DIR/dev-kubeconfig"; rm -rf "$ERR_DIR"
 }
-trap cleanup EXIT
+on_exit() { cleanup; audit_repos "after session"; notes_snapshot "after session $(date +%F\ %T)"; }
+trap on_exit EXIT
 cleanup                                                           # leftovers of a crashed launch
 
 docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
 docker run -d --rm --name "$NETNS" --network "$NET" "${PORTS[@]}" "${SIDECAR[@]}" "$PAUSE_IMAGE" >/dev/null
-if [ -n "$STACK_KUBE_TOKEN" ]; then
+if [ -n "$KIND_CLUSTER" ] && docker network inspect "$KIND_NET" >/dev/null 2>&1; then   # reach, not access
   docker network connect "$KIND_NET" "$NETNS" || echo "⚠ could not join docker network '$KIND_NET' — kind unreachable" >&2
 fi
 

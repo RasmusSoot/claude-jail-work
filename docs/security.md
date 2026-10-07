@@ -24,7 +24,7 @@ graph LR
         REPO["~/claude/claude-jail-work<br/>this repo"]
         STATE["~/claude/jail/.claude-data*<br/>login + per-stack state"]
         ENV[".env.#lt;stack#gt;<br/>tokens + client facts · 600"]
-        WS["~/claude/jail/#lt;stack#gt;/#lt;repo#gt;"]
+        WS["~/claude/jail/#lt;stack#gt;/<br/>repos + notes/"]
         HKUBE["host kubeconfig"]
         LAUNCH(["tools/stack-jail.sh"])
         BROWSER["Browser"]
@@ -44,7 +44,7 @@ graph LR
         DP["dev proxy sidecar<br/>holds dev token<br/>127.0.0.1:8001"]
     end
 
-    NIX[("named volumes<br/>jail-nix")]
+    NIX[("Nix volumes<br/>jail-nix · jail-nix-#lt;stack#gt;")]
 
     subgraph ext["Outside"]
         AI(["claude.ai login"])
@@ -57,7 +57,7 @@ graph LR
     REPO -- "rw" --> main
     REPO -- "tools/ ro" --> stack
     STATE -- "own state dir rw<br/>shared .credentials.json" --> main & stack
-    WS -- "rw (own stack)<br/>ro under /reads (READS)" --> stack
+    WS -- "rw (own stack, git internals ro)<br/>ro under /reads (READS)" --> stack
     NIX --> main & stack
 
     ENV --> LAUNCH
@@ -74,8 +74,9 @@ graph LR
     MCL -- "/login via 127.0.0.1:54545" --> AI
 ```
 
-`jail-main` is normally the only session that maps the OAuth callback port (`stack-jail.sh <stack> --login` is the exception). It logs in once and every stack
-jail reuses the token through a single-file mount of `.credentials.json`.
+`jail-main` is normally the only session that maps the OAuth callback port
+(`stack-jail.sh <stack> --login` is the exception). It logs in once and every stack jail reuses the
+token through a single-file mount of `.credentials.json`.
 
 ## Measures in place
 
@@ -84,10 +85,10 @@ jail reuses the token through a single-file mount of `.credentials.json`.
 | Measure | Where | Stops |
 |---|---|---|
 | Only listed paths are mounted: no `~/.ssh`, `~/.kube`, `~/.aws`, Docker socket, host dotfiles | `docker-compose.yml`, `tools/stack-jail.sh` | The session reaching host credentials or controlling Docker |
-| No sudo; `node` remapped to the host UID/GID | `Dockerfile` | Container root, which would have host-root reach over the bind mounts |
+| No sudo; the `claude` user has the host UID/GID | `Dockerfile` | Container root, which would have host-root reach over the bind mounts |
 | Stack jails mount `tools/` read-only and get no part of this repo besides it | `docker-compose.yml` | A stack jail rewriting the launcher, `kdev` or the session card |
 | Other stacks' repos (`READS`) mounted read-only, with no tokens or state | `tools/stack-jail.sh` | Writing to or pushing from another stack's tree |
-| Jail-only Nix store (`jail-nix` volume, Nix pinned and checksummed in the image); the host `/nix` is never mounted | `Dockerfile`, `docker-compose.yml` | A jail replacing store binaries that the host's devbox or Nix profile runs (the host store is single-user and owned by the host UID) |
+| Jail-only Nix stores (Nix pinned and checksummed in the image): `jail-nix` for the login jail and one `jail-nix-<stack>` volume per stack; the host `/nix` is never mounted | `Dockerfile`, `docker-compose.yml` | A jail replacing store binaries that the host's devbox or Nix profile runs (the host store is single-user and owned by the host UID), or that another stack's jail runs (a cross-client path) |
 | Separate jail git identity; host `~/.gitconfig` not mounted | `docker-compose.yml`, `setup-env.sh` | Host git config (credential helpers, includes) leaking in |
 | Permission mode is whatever the managed policy allows; the launcher passes no bypass flag (`JAIL_CLAUDE_FLAGS` exists for a granted exception) | `tools/stack-jail.sh`, `.aliases` | The jail weakening the employer policy |
 
@@ -98,8 +99,10 @@ jail reuses the token through a single-file mount of `.credentials.json`.
 | GitHub: fine-grained PAT, resource owner = the fork org, Contents R/W + Metadata, no Pull requests | `.env.<stack>` (filled by the human) | Writing to any upstream or opening PRs |
 | Client GitLab: read-only personal token for fetching; a deploy token with `write_repository` scoped to the human's personal fork, which has a protected `main` | `.env.<stack>`, `tools/stack-jail-init.sh` | Writing to the client's upstream or to the fork's `main` |
 | Per-host credential store built at session start, path-specific GitLab entry first | `tools/stack-jail-init.sh` | Tokens appearing in remote URLs; the write token being used for the wrong path |
-| Each repo's `.git/config` and `.git/hooks` (and every submodule's under `.git/modules`) mounted read-only over the rw repo mount; a `.git` file (worktree) gets a warning instead | `tools/stack-jail.sh` | A jail planting a hook, `core.fsmonitor`, `core.sshCommand` or a filter driver that runs on the **host** the next time host git or an IDE touches the repo. Cost: no repo-config writes in the jail (`push -u`, `remote add`, `branch --set-upstream-to`) |
-| Pushes are the human's (`! git push`); by convention `upstream` remotes get `no_push://disabled` as push URL when cloned | jail card, each repo's config | Code reaching upstream except as a merge request the human opens |
+| Each repo's `.git/config`, `.git/hooks` and `.git/commondir` (and every submodule's under `.git/modules`, and the notes repo's) mounted read-only over the rw repo mount. `commondir` is written as `.` on the host first: git would otherwise follow a planted `commondir` to a config the jail controls. A pre-existing `commondir` other than `.` stops the launch; a `.git` file (worktree) gets a warning | `tools/stack-jail.sh` | A jail planting a hook, `core.fsmonitor`, `core.sshCommand` or a filter driver that runs on the **host** the next time host git or an IDE touches the repo. Cost: no repo-config writes in the jail (`push -u`, `remote add`, `branch --set-upstream-to`) |
+| Host-side git audit at launch and exit: nested repositories planted in a working tree (real submodules excepted), a changed `commondir`, `config.worktree`, linked worktrees | `tools/stack-jail.sh` | What mounts cannot block: an IDE auto-detecting a planted nested repo and running git in it with *its* config. Warns; deleting is the human's call |
+| Remotes are set only on the host, by `tools/stack-fork.sh` with your own `gh` login: fork into the fork org (checked to really be a fork of the upstream), `upstream` with push URL `no_push://disabled`, `origin` = the fork. Its git calls into existing clones are hardened like the notes snapshots | `tools/stack-fork.sh` | An accidental push to upstream; a jail rewiring remotes (it can't: `.git/config` is read-only) |
+| Pushes are the human's (`! git push`) | jail card | Code reaching upstream except as a merge request the human opens |
 
 ### Kubernetes
 
@@ -107,6 +110,7 @@ jail reuses the token through a single-file mount of `.credentials.json`.
 |---|---|---|
 | Two kubeconfig **files**, never merged: `kind.yaml` (plain `kubectl`), `dev.yaml` (only through `kdev`) | `tools/stack-jail-init.sh` | Pointing a command at the wrong cluster by context mix-up |
 | Both tokens minted per launch from the host credential, 8h, then checked for JWT shape and the expected `sub` claim | `tools/stack-jail.sh` | Injecting a long-lived or wrong-subject token |
+| kind gate: no token unless the stack namespace enforces Pod Security `baseline`/`restricted`, and the SA cannot patch/update/delete that namespace, create namespaces or create pods elsewhere | `tools/stack-jail.sh` | A namespace admin running a privileged, `hostPath` or `hostPID` pod on a privileged kind node, i.e. reaching the host |
 | Dev SA gate: the launcher reads its **full** `auth can-i --list` by impersonation and refuses to mint if any rule allows a verb besides get/list/watch, or touches `secrets` or a wildcard resource | `tools/stack-jail.sh` | A mis-scoped "read-only" SA (e.g. `list secrets`, `pods/exec`, `serviceaccounts/token`) reaching the jail |
 | Dev token never enters the jail: a `kubectl proxy` sidecar in the jail's network namespace holds it and serves on `127.0.0.1:8001`; the jail's `dev.yaml` has no credential. The proxy refuses every method but GET/HEAD and any path segment `secrets`, `exec`, `attach`, `portforward` or `proxy`, for any client (`kdev`, raw `kubectl`, `curl`). Its request log is saved to `~/claude/jail/.run-<stack>/` at session end | `tools/stack-jail.sh` | Token theft (nothing to copy out); writes, secret reads, exec and port-forwards even if a session skips `kdev` |
 | `kdev`: read-verb allowlist, refuses `secret` args, prints a cluster banner; runs the repo's devbox `kubectl` with no init_hook | `tools/kdev` | *Convenience.* The proxy and RBAC are the boundary |
@@ -126,15 +130,27 @@ jail reuses the token through a single-file mount of `.credentials.json`.
 
 | Measure | Where | Stops |
 |---|---|---|
+| Per-stack `notes/` next to the repos: outside every repo, a local git repo with no remote, snapshotted by the launcher before and after each session with a hardened host-side git (explicit `GIT_DIR`/`GIT_COMMON_DIR`, fsmonitor and hooks off, no host config). The upload inbox lives in `notes/uploads/` (gitignored) | `tools/stack-jail.sh` | Notes or uploaded screenshots being committed to a client repo; agent-written notes going unreviewed (`git -C notes log -p`) |
 | No client facts in this repo (CIDRs, hostnames, SA names, GitLab URL); they live in the gitignored `.env.<stack>` (mode 600) | `CLAUDE.md`, `.gitignore` | Client data in a repo that may be published |
+| Host-side scripts take `kubectl`, `kind` and `gh` from this repo's `devbox.json` (exact versions), never from a stack repo's devbox, which a jail can write | `tools/host-tools.sh`, `devbox.json` | A stale host binary breaking a gate (an old `kubectl` without `create token`); a jail-planted "kubectl" running on the host with your credentials |
 | Host `~/.zshrc` sources a pinned copy (`~/claude/jail/.aliases.pinned`) that only `jail-pin` updates after showing the diff; a mismatch with the repo prints a warning | `tools/pin-aliases.sh`, host `~/.zshrc` | An unreviewed `.aliases` edit running in every new host shell |
 
 ## Accepted risks
 
-- **`jail-main` can edit host-executed files.** It mounts this repo rw, and the host runs
-  `.aliases`, the launcher and `stacks/*.conf` from that tree. Accepted: `jail-main` sees no client
+- **`jail-main` can edit host-executed files.** It mounts this repo rw, and the host runs from that
+  tree: `.aliases`, `stacks/*.conf`, every script in `tools/` that runs on the host (the launcher,
+  `stack-fork.sh`, `stack-env.sh`, `host-tools.sh`, `pin-aliases.sh`), and `devbox.json` /
+  `devbox.lock`, which decide what `kubectl`, `kind` and `gh` the host scripts run. Accepted: `jail-main` sees no client
   content, so there's little to inject through, every change is a reviewed diff, and the host shell
   sources a pinned copy of `.aliases`. A separate run-only checkout would close it completely if that changes.
+- **The host IDE shares the jail's working tree.** Mounts and the audit keep git's own machinery
+  from running jail-written code. Build files are different: `pom.xml`, `.mvn/`, `devbox.json`
+  hooks, `.envrc`, `.vscode/`, `.idea/` run when you build, import or open them on the host. Review
+  the diff before building on the host, and keep IDE auto-run features (automatic tasks, Maven
+  auto-import, nested-repo auto-detection) off for these folders.
+- **Notes persist across sessions in both directions.** A session steered by injected content could
+  leave instructions for later sessions there, as it could in Claude's own memory. The snapshots
+  make that reviewable, not impossible.
 - **Client repos are pre-trusted** (`hasTrustDialogAccepted`). A repo-supplied
   `.claude/settings.json` hook would run without a prompt, but inside that jail.
 - **Unsetting tokens in `stack-jail-init.sh` hides nothing.** The git tokens and the kind token
@@ -148,16 +164,14 @@ jail reuses the token through a single-file mount of `.credentials.json`.
 - **Build inputs are latest-at-build-time** (devbox install script, the Claude Code native
   installer, `debian:trixie` by tag). The image is built locally, not by CI, so nothing
   would bump pins: they would only freeze out security fixes. All come over HTTPS from their
-  vendors. Nix is the exception — pinned and checksummed, because it seeds the persistent
-  `jail-nix` volume.
+  vendors. Deliberate exceptions, bumped by hand: Nix (pinned and checksummed — it seeds the
+  persistent Nix volumes), the host tools in `devbox.json`, and the `kubectl` and `pause` sidecar
+  images in the launcher.
 - **Network egress is open.** A session can send what it can read anywhere it can reach. The
   answer is to keep what it can read small, not to filter traffic.
 
 ## Open
 
-- **kind node escape.** kind nodes are privileged containers, so a namespace admin who can run a
-  privileged or `hostPath` pod can probably reach the host. Planned: the launcher refuses the kind
-  mint unless the namespace enforces Pod Security `baseline` or `restricted` and the SA cannot
-  patch its namespace. The label itself belongs in the lab repo.
-- **Shared `jail-nix` across stacks.** One stack's jail can tamper with packages another stack's
-  jail runs, which crosses clients. Planned: a `jail-nix-<stack>` volume per stack.
+- **kind Pod Security label.** The launcher now refuses the kind token without it (see above), but
+  the label itself (`pod-security.kubernetes.io/enforce: baseline` on each stack namespace) still
+  has to be added where the SA and RoleBinding live, in the lab repo.

@@ -53,6 +53,7 @@ fmt_when() {
 
 # CWD label: stack jails show the stack name, the login jail shows "jail".
 root="${STACK_NAME:-jail}"
+# shellcheck disable=SC2088  # "~/…" is display text, not a path
 case "$cwd" in
   /workspace)    cwd_short="$root" ;;
   /workspace/*)  cwd_short="$root/${cwd#/workspace/}" ;;
