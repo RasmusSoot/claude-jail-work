@@ -65,7 +65,7 @@ graph LR
             KDEV["kdev (wrapper)"]
             UP["upload server :8000<br/>token-gated"]
         end
-        PAUSE["pause: networks + ports"]
+        PAUSE["pause: networks + ports +<br/>hosts: www.#lt;host#gt; = loopback"]
         DP["dev proxy sidecar<br/>holds dev token<br/>127.0.0.1:8001"]
         GP["git proxy sidecar<br/>holds git tokens<br/>127.0.0.1:8002"]
     end
@@ -88,12 +88,13 @@ graph LR
 
     ENV --> LAUNCH
     HKUBE --> LAUNCH
-    LAUNCH -- "mint 8h SA tokens<br/>after gates" --> stack
-    LAUNCH -- "scoped git tokens" --> GP
+    LAUNCH -- "mint 8h SA tokens after gates ·<br/>gh: public-only PAT after gate" --> stack
+    LAUNCH -- "scoped git tokens +<br/>read/write allowlists" --> GP
 
-    SCL -- "git over plain HTTP on loopback,<br/>no credential (url.insteadOf)" --> GP
+    SCL -- "git over plain HTTP to www.#lt;host#gt;:8002,<br/>no credential (url.insteadOf)" --> GP
     GP -- "receive-pack: this stack's forks only" --> FORK
-    GP -- "upload-pack only" --> UPSTREAM
+    GP -- "upload-pack · token only for<br/>this stack's repos" --> UPSTREAM
+    SCL -- "gh: reads at 5000/h ·<br/>writes refused by GitHub" --> UPSTREAM
     SCL -- "namespace-admin, 8h" --> KIND
     KDEV -- "plain HTTP on loopback,<br/>no credential" --> DP
     DP -- "GET/HEAD only, no secrets/exec,<br/>RBAC read-only, 8h" --> DEV
@@ -190,12 +191,12 @@ token through a single-file mount of `.credentials.json`.
 - **`jail-main` holds `GH_TOKEN` directly** (`.env`, credential store in `tools/jail-entrypoint.sh`):
   it has no pod namespace and no sidecar. Accepted for now because it sees only this repo, no
   client content to be steered by; the token's scope is still the fork org.
-- **`gh` in a stack jail is a read tool with a public-only token, or unauthenticated.** The
+- **`gh` in a stack jail is a read tool with a public-only token, or nothing.** The
   harmless-class token above is in the jail's environment on purpose. Its permission set cannot be
   probed without writing, so "no permissions" rests on the human's token setup; the gate only
-  proves it is fine-grained, valid and blind to private repositories. Without it, `gh` still answers
-  public reads at the anonymous rate limit, which is throttled at random times. Either way every
-  write is refused by GitHub, not by anything in the jail.
+  proves it is fine-grained, valid and blind to private repositories. Without it, `gh` refuses to
+  run at all (it wants a login even for public reads). With it, every write is refused by GitHub,
+  not by anything in the jail.
 - **Every jail holds the Anthropic OAuth credentials**, read-write for token refresh. A compromised
   jail has the account session.
 - **Build inputs are latest-at-build-time** (devbox install script, the Claude Code native

@@ -91,8 +91,9 @@ token. Identities, by design:
    serves read-only on `127.0.0.1:8001`. Then it starts `claude` in that namespace with no git
    token, no dev token and no bypass flag, and removes the sidecars (saving their request logs)
    when the session ends.
-   `tools/stack-jail-init.sh` builds the per-host git credential store, writes `~/.kube/kind.yaml`
-   and a credential-less `~/.kube/dev.yaml`, and renders the session card.
+   `tools/stack-jail-init.sh` routes git to the sidecar (`url.insteadOf`, no credential store),
+   writes `~/.kube/kind.yaml` and a credential-less `~/.kube/dev.yaml`, and renders the session
+   card.
 
 ## Not in this variant
 
