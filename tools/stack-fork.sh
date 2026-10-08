@@ -76,7 +76,8 @@ for r in $REPOS; do
     echo "   fork exists: $fork"
   else
     echo "   forking $up → $FORK_ORG (default branch only)"
-    gh repo fork "$up" --org "$FORK_ORG" --default-branch-only --clone=false --remote=false >/dev/null \
+    # --remote is rejected when a repository argument is given; with --clone=false none is added anyway.
+    gh repo fork "$up" --org "$FORK_ORG" --default-branch-only --clone=false >/dev/null \
       || { echo "   ✗ gh repo fork failed" >&2; failed="$failed $r"; continue; }
     wait_for_fork "$fork" || { failed="$failed $r"; continue; }
   fi
