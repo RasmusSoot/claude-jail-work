@@ -43,7 +43,8 @@ services:
   #   - no repo mount of this repo except tools/ (read-only): the upload server, init, kdev
   #   - per-stack ~/.claude state; only the credentials file crosses over from the login jail
   #   - no networks of its own: it joins the namespace of a pause container the launcher starts
-  #     (per-stack bridge + kind network + published ports), shared with the dev proxy sidecar
+  #     (per-stack bridge + kind network + published ports), shared with the git and dev proxy sidecars
+  #   - no git token: the gitproxy sidecar below holds them and the jail's git is routed to it
   stack:
     build:
       context: .
@@ -65,6 +66,27 @@ services:
     security_opt: [no-new-privileges:true]
     stdin_open: true
     tty: true
+
+  # GIT CREDENTIAL SIDECAR for a stack jail: tools/gitproxy/gitproxy.py, the same image with python3.
+  # Started by tools/stack-jail.sh into the jail's network namespace, holding the GitHub/GitLab
+  # tokens the jail no longer gets; the jail's git reaches it on 127.0.0.1:8002 via url.insteadOf.
+  # Same posture as the dev proxy: read-only root, no capabilities, no networks of its own.
+  gitproxy:
+    build:
+      context: .
+      args:
+        HOST_UID: ${HOST_UID}
+        HOST_GID: ${HOST_GID}
+    entrypoint: ["/usr/bin/tini", "-g", "--", "python3", "/workspace/tools/gitproxy/gitproxy.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./tools:/workspace/tools:ro
+    network_mode: "container:${JAIL_NETNS:-launch-via-tools-stack-jail-sh}"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
 
 volumes:
   # Jail-only Nix stores, isolated from the host and from each other: one for the login jail, one per

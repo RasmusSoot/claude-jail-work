@@ -13,11 +13,15 @@ human pushes.
 
 ## The boundaries (tokens + git — everything else is scenery)
 
-- **git**: `upstream` remotes are fetch-only. `origin` is the human's fork and the only place any
-  token here can write. Code reaches upstream only through a merge or pull request the human opens
+- **git**: `upstream` remotes are fetch-only. `origin` is the human's fork and the only place a
+  push can land. Code reaches upstream only through a merge or pull request the human opens
   under their own name. Add a `Co-Authored-By` trailer to
   commits you author. In stack jails each repo's `.git/config`, `.git/hooks` and `.git/commondir` are read-only, so
   `push -u`, `remote add` and `branch --set-upstream-to` fail by design — push without `-u`.
+  There is no git token in a stack jail: a credential sidecar on loopback adds it, forwards git
+  smart-HTTP only (no GitHub/GitLab API), and refuses pushes to anything but the stack's forks.
+  `git remote -v` shows the configured URL, `git ls-remote --get-url origin` the one actually used.
+  A 403 from it is the policy, not a bug; do not look for another route.
 - **kubectl**: plain `kubectl` is the LOCAL KIND cluster (namespace-admin, disposable — destructive
   verbs are fine there). `kdev` is the CLIENT DEV cluster, read-only through a proxy that holds the
   token (no credential is in this jail): anything but GET, and any secrets, exec, attach,

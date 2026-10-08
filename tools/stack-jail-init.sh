@@ -1,33 +1,32 @@
 # shellcheck shell=bash
 # stack-jail-init — sourced (bash) inside a per-stack jail before exec'ing claude.
 # Consumes the env tools/stack-jail.sh injects. Everything here is container-local session state
-# (credential store, kubeconfig files, session card); nothing persists but ~/.claude.
+# (git routing, kubeconfig files, session card); nothing persists but ~/.claude.
 # Sourced, not executed: exports into the claude process. Always returns 0.
 
 _sj_warn() { echo "stack-jail-init: $*" >&2; }
 
-# ── git identity + per-host credential routing ──────────────────────────────────────────────────
+# ── git identity + routing through the credential sidecar ───────────────────────────────────────
+# No token and no credential helper in here. Every URL shape of github.com and the client GitLab
+# (https, http, scp-style ssh, ssh://) is rewritten to the gitproxy sidecar on the namespace's
+# loopback, which adds the credential and enforces the push allowlist. Repo configs stay as the host
+# wrote them (and are read-only), so the host keeps using its own remotes, SSH keys and helpers.
+# `git remote -v` shows the configured URL; `git ls-remote --get-url origin` shows the rewritten one.
 if [ -f /home/claude/.gitconfig-base ]; then cp /home/claude/.gitconfig-base "$HOME/.gitconfig"; else _sj_warn "no .gitconfig-base — set user.name/email"; fi
-git config --global credential.helper "store --file $HOME/.git-credentials"
 git config --global remote.pushDefault origin        # triangular: track upstream, push to the fork
 git config --global push.default current
-: > "$HOME/.git-credentials"; chmod 600 "$HOME/.git-credentials"
-# github.com: ONE entry — the fork-org token. Its reach is set by GitHub (the org's repos), not by path;
-# it also authenticates reads of public upstreams (rate limits), and cannot write outside the org.
-if [ -n "${GH_TOKEN:-}" ]; then
-  printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" >> "$HOME/.git-credentials"
+if [ -n "${STACK_GITPROXY:-}" ]; then
+  _sj_route() { # <host>
+    local u; for u in "https://$1/" "http://$1/" "git@$1:" "ssh://git@$1/"; do
+      git config --global --add "url.$STACK_GITPROXY/$1/.insteadOf" "$u"
+    done
+  }
+  _sj_route github.com
+  [ -n "${GITLAB_HOST:-}" ] && _sj_route "$GITLAB_HOST"
+  export GIT_TERMINAL_PROMPT=0                       # a refused request fails; nothing here could answer a prompt
+  _sj_git="GitHub${GITLAB_HOST:+ and GitLab} traffic goes through a credential sidecar (no git token in this jail; git smart-HTTP only, so no API access). Pushes are accepted ONLY to: ${GITPROXY_WRITE:-<none>}."
 else
-  _sj_warn "GH_TOKEN empty — GitHub pushes/gh will not work"
-fi
-# GitLab: path-specific deploy token FIRST (store returns the first match), host-wide read token after.
-if [ -n "${GITLAB_HOST:-}" ]; then
-  git config --global "credential.https://$GITLAB_HOST.useHttpPath" true
-  if [ -n "${GITLAB_DEPLOY_TOKEN:-}" ] && [ -n "${GITLAB_FORK_PATH:-}" ]; then
-    printf 'https://%s:%s@%s/%s\nhttps://%s:%s@%s/%s.git\n' \
-      "${GITLAB_DEPLOY_USER:-gitlab+deploy-token}" "$GITLAB_DEPLOY_TOKEN" "$GITLAB_HOST" "$GITLAB_FORK_PATH" \
-      "${GITLAB_DEPLOY_USER:-gitlab+deploy-token}" "$GITLAB_DEPLOY_TOKEN" "$GITLAB_HOST" "$GITLAB_FORK_PATH" >> "$HOME/.git-credentials"
-  fi
-  [ -n "${GITLAB_READ_TOKEN:-}" ] && printf 'https://oauth2:%s@%s\n' "$GITLAB_READ_TOKEN" "$GITLAB_HOST" >> "$HOME/.git-credentials"
+  _sj_git="no credential sidecar this session — public fetches only, every push fails."
 fi
 
 # ── kubectl: two FILES, never two contexts in one ───────────────────────────────────────────────
@@ -75,7 +74,7 @@ export PATH="/workspace/tools:$PATH"                   # kdev
 
 - **Stack: ${STACK_NAME:-?}.** Mounted repos under \`/workspace\`: ${STACK_REPOS:-<none>}. Nothing else of the host is visible.
 - **Read-only views**: $(if [ -n "${STACK_READS:-}" ]; then echo "$(printf '%s' "${STACK_READS}" | tr ' ' '\n' | sed 's|\(.*\):\(.*\)|/reads/\1/\2|' | paste -sd, -) — other stacks' working trees as they are on the host, uncommitted edits included. Read, compare, cite; never try to write, build in, or push from them — their remotes and tokens are not in this jail."; else echo "none this session."; fi)
-- **git**: \`upstream\` is fetch-only; \`origin\` is YOUR fork and the only place any token here can write. GitHub token present: $([ -n "${GH_TOKEN:-}" ] && echo yes || echo no). GitLab deploy token present: $([ -n "${GITLAB_DEPLOY_TOKEN:-}" ] && echo yes || echo no). Pushes are the human's (\`! git push\`); add a Co-Authored-By trailer to commits you author.
+- **git**: \`upstream\` is fetch-only; \`origin\` is YOUR fork. ${_sj_git} Pushes are the human's (\`! git push\`); add a Co-Authored-By trailer to commits you author.
 - **kubectl (kind)**: ${_sj_kind}
 - **kdev (client dev)**: ${_sj_dev}
 - **notes**: \`/workspace/notes\` — the human's and agents' shared, persistent notes for this stack. Never committed to any repo or published; client facts are fine here. A local git repo with no remote: the launcher snapshots it before and after each session, so whatever you write is reviewed. Read it at the start of non-trivial work; write things meant to outlast this session.
@@ -86,7 +85,7 @@ EOT
   if [ -f /workspace/tools/jail-card.md ]; then cat /workspace/tools/jail-card.md; else _sj_warn "tools/jail-card.md missing"; echo "(ground-rules card missing)"; fi
 } > /workspace/CLAUDE.local.md 2>/dev/null || _sj_warn "could not write /workspace/CLAUDE.local.md"
 
-unset _sj_kind _sj_dev GITLAB_DEPLOY_TOKEN GITLAB_READ_TOKEN
+unset _sj_kind _sj_dev _sj_git
 unset STACK_KUBE_TOKEN STACK_KUBE_CA
-unset -f _sj_warn _sj_kubeconfig 2>/dev/null
+unset -f _sj_warn _sj_kubeconfig _sj_route 2>/dev/null
 true

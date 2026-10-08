@@ -11,9 +11,11 @@
 # Nothing client-derived may live in this repo — only in the env file (see CLAUDE.md).
 #
 # Boundaries are tokens + git; everything else is scenery:
-#   - git: a fork-scoped GitHub token (resource owner = the trust-domain org, never the upstream),
-#     a GitLab deploy token on a personal fork inside the client's GitLab, a read-only GitLab token
-#     for fetching upstream. No token in a jail can write to an upstream repo.
+#   - git: NO token in the jail. A gitproxy sidecar in the jail's network namespace holds the
+#     fork-scoped GitHub token (resource owner = the trust-domain org, never the upstream), the
+#     GitLab deploy token for a personal fork inside the client's GitLab and the read-only GitLab
+#     token for fetching upstream; it forwards git smart-HTTP only, and accepts pushes only for the
+#     stack's forks. The jail's git is routed to it with url.insteadOf (tools/stack-jail-init.sh).
 #   - kubectl: TWO kubeconfig FILES, minted here per launch from the host credential, 8h:
 #     kind.yaml = namespace-admin workbench SA on the local kind cluster (plain `kubectl`);
 #     dev.yaml  = NO credential: points at a kubectl-proxy sidecar in the jail's network namespace
@@ -205,7 +207,7 @@ export STACK_NAME="$STACK" JAIL_NAME="$STACK" KIND_NET STACK_REPOS="$REPOS" UPLO
 # shellcheck disable=SC2086  # unquoted on purpose: echo squeezes the list's whitespace
 JAIL_READS="$(echo ${READS:-} | tr ' ' '+')"
 export STACK_READS="${READ_PAIRS# }" JAIL_READS
-export GH_TOKEN GITLAB_HOST GITLAB_READ_TOKEN GITLAB_FORK_PATH GITLAB_DEPLOY_USER GITLAB_DEPLOY_TOKEN
+export GITLAB_HOST GITLAB_FORK_PATH FORK_ORG                     # facts for the card; the git tokens go to the sidecar only
 VOLS=(
   -v "$STATE_DIR:/home/claude/.claude"
   -v "$SHARED_CREDS:/home/claude/.claude/.credentials.json"
@@ -303,18 +305,23 @@ PORTS=(-p "127.0.0.1:$UPLOAD_PORT:8000")                       # loopback only �
 # from processes inside that namespace, so nothing on the host, the LAN, other containers or kind
 # pods can reach it, by construction. The dev token lives only in the proxy container (own PID and
 # mount namespaces): the jail gets a credential-less kubeconfig, and the proxy refuses writes,
-# secrets, exec/attach/portforward and service/pod proxying whoever the client is.
-NETNS="jail-$STACK-net"; DEVPROXY="jail-$STACK-devproxy"; NET="jail-$STACK"
-RUN_DIR="$JAIL_HOME/.run-$STACK"; mkdir -p "$RUN_DIR"; chmod 700 "$RUN_DIR"   # dev proxy audit logs
+# secrets, exec/attach/portforward and service/pod proxying whoever the client is. The git tokens
+# live the same way in a gitproxy sidecar (127.0.0.1:8002): git smart-HTTP only, pushes only to
+# this stack's forks, whoever the client is.
+NETNS="jail-$STACK-net"; DEVPROXY="jail-$STACK-devproxy"; GITPROXY="jail-$STACK-gitproxy"; NET="jail-$STACK"
+RUN_DIR="$JAIL_HOME/.run-$STACK"; mkdir -p "$RUN_DIR"; chmod 700 "$RUN_DIR"   # sidecar audit logs
 PAUSE_IMAGE="${PAUSE_IMAGE:-registry.k8s.io/pause:3.10}"
 KUBECTL_IMAGE="${KUBECTL_IMAGE:-registry.k8s.io/kubectl:v1.37.1}"
 SIDECAR=(--read-only --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)")
 
 cleanup() {
-  if docker container inspect "$DEVPROXY" >/dev/null 2>&1; then
-    docker logs "$DEVPROXY" > "$RUN_DIR/devproxy-$(date +%Y%m%dT%H%M%S).log" 2>&1 || true
-  fi
-  docker rm -f "$DEVPROXY" "$NETNS" >/dev/null 2>&1 || true
+  local c
+  for c in devproxy gitproxy; do
+    if docker container inspect "jail-$STACK-$c" >/dev/null 2>&1; then
+      docker logs "jail-$STACK-$c" > "$RUN_DIR/$c-$(date +%Y%m%dT%H%M%S).log" 2>&1 || true
+    fi
+  done
+  docker rm -f "$DEVPROXY" "$GITPROXY" "$NETNS" >/dev/null 2>&1 || true
   rm -f "$RUN_DIR/dev-kubeconfig"; rm -rf "$ERR_DIR"
 }
 on_exit() { cleanup; audit_repos "after session"; notes_snapshot "after session $(date +%F\ %T)"; }
@@ -366,11 +373,44 @@ fi
 unset STACK_DEVKUBE_TOKEN STACK_DEVKUBE_CA
 export STACK_DEVKUBE_PROXY JAIL_NETNS="$NETNS"
 
-# Not exec: the EXIT trap has to remove the holder + proxy (and save the proxy log) afterwards.
+# ── git: the tokens go to the gitproxy sidecar, never to the jail ───────────────────────────────
+# Write allowlist = this stack's forks only: FORK_ORG/<repo> for each REPOS entry on GitHub, and the
+# GitLab fork path. The GitHub token reaches every repo in the fork org (other stacks' forks too);
+# the allowlist narrows it to this stack's. Anything else the sidecar refuses before the token is used.
+STACK_GITPROXY="" GITPROXY_WRITE=""
+if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITLAB_HOST:-}" ]; then
+  if [ -n "${GH_TOKEN:-}" ] && [ -n "${FORK_ORG:-}" ]; then
+    for r in $REPOS; do GITPROXY_WRITE="$GITPROXY_WRITE,github.com/$FORK_ORG/$r"; done
+  fi
+  [ -n "${GITLAB_HOST:-}" ] && [ -n "${GITLAB_FORK_PATH:-}" ] && GITPROXY_WRITE="$GITPROXY_WRITE,$GITLAB_HOST/$GITLAB_FORK_PATH"
+  GITPROXY_WRITE="${GITPROXY_WRITE#,}"
+  export GITPROXY_WRITE GITPROXY_LISTEN="127.0.0.1:8002" GH_TOKEN GITLAB_HOST GITLAB_READ_TOKEN GITLAB_FORK_PATH GITLAB_DEPLOY_USER GITLAB_DEPLOY_TOKEN
+  docker compose -f "$HERE/docker-compose.yml" run -d --name "$GITPROXY" \
+    -e GITPROXY_LISTEN -e GITPROXY_WRITE -e GH_TOKEN -e GITLAB_HOST -e GITLAB_READ_TOKEN \
+    -e GITLAB_FORK_PATH -e GITLAB_DEPLOY_USER -e GITLAB_DEPLOY_TOKEN gitproxy >/dev/null 2>"$ERR_DIR/gitproxy.err" || true
+  for _ in $(seq 1 50); do
+    docker logs "$GITPROXY" 2>&1 | grep -q 'gitproxy: serving' && break
+    docker container inspect -f '{{.State.Running}}' "$GITPROXY" 2>/dev/null | grep -q true || break
+    sleep 0.2
+  done
+  if docker logs "$GITPROXY" 2>&1 | grep -q 'gitproxy: serving'; then
+    STACK_GITPROXY="http://$GITPROXY_LISTEN"
+    echo "→ git: credential sidecar up in the jail's namespace (tokens stay in $GITPROXY; pushes only to: ${GITPROXY_WRITE:-<none>}; audit log → $RUN_DIR/)"
+  else
+    echo "⚠ git: sidecar did not start — the session has NO git credential (public fetches only). It said:" >&2
+    { cat "$ERR_DIR/gitproxy.err"; docker logs "$GITPROXY" 2>&1; } | tail -5 | sed 's/^/    /' >&2
+  fi
+else
+  echo "→ git: no GH_TOKEN and no GITLAB_HOST in $ENV_FILE — no git credential this session"
+fi
+unset GH_TOKEN GITLAB_READ_TOKEN GITLAB_DEPLOY_USER GITLAB_DEPLOY_TOKEN
+export STACK_GITPROXY GITPROXY_WRITE
+
+# Not exec: the EXIT trap has to remove the holder + sidecars (and save their logs) afterwards.
 docker compose -f "$HERE/docker-compose.yml" run --rm \
   "${VOLS[@]}" \
   -e STACK_NAME -e JAIL_NAME -e JAIL_READS -e STACK_REPOS -e STACK_READS -e UPLOAD_DIR -e UPLOAD_HOST_PORT \
-  -e GH_TOKEN -e GITLAB_HOST -e GITLAB_READ_TOKEN -e GITLAB_FORK_PATH -e GITLAB_DEPLOY_USER -e GITLAB_DEPLOY_TOKEN \
+  -e STACK_GITPROXY -e GITPROXY_WRITE -e GITLAB_HOST -e GITLAB_FORK_PATH -e FORK_ORG \
   -e STACK_KUBE_TOKEN -e STACK_KUBE_SERVER -e STACK_KUBE_CA -e STACK_KUBE_NS -e STACK_KUBE_SA \
   -e STACK_DEVKUBE_PROXY -e STACK_DEVKUBE_NS -e STACK_DEVKUBE_SA \
   stack \

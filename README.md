@@ -18,7 +18,7 @@ this repo.
 ~/claude/jail/<stack>/notes/        shared notes + upload inbox: local git, no remote, never published
 ~/claude/jail/.env.<stack>          tokens + client FACTS (outside any repo, mode 600; tools/stack-env.sh)
 ~/claude/jail/.claude-data*         Claude state: shared login + per-stack memory/history
-~/claude/jail/.run-<stack>/         dev proxy request logs, one per session
+~/claude/jail/.run-<stack>/         sidecar request logs (git proxy, dev proxy), one each per session
 ```
 
 ## Bootstrap
@@ -57,9 +57,9 @@ token. Identities, by design:
 
 | Purpose | Credential | Reach |
 |---|---|---|
-| GitHub forks | fine-grained PAT, resource owner = your trust-domain org, Contents R/W + Metadata, no Pull requests | the org's forks only |
-| Client GitLab, read | personal token, `read_repository` | fetch upstream |
-| Client GitLab, write | deploy token, `write_repository`, on YOUR fork inside the client's GitLab, protected `main` | that fork's unprotected branches |
+| GitHub forks | fine-grained PAT, resource owner = your trust-domain org, Contents R/W + Metadata, no Pull requests; held by the git proxy sidecar, never by the jail | pushes to this stack's forks only (the sidecar's allowlist), fetches anywhere on github.com |
+| Client GitLab, read | personal token, `read_repository`; held by the sidecar | fetch upstream |
+| Client GitLab, write | deploy token, `write_repository`, on YOUR fork inside the client's GitLab, protected `main`; held by the sidecar | that fork's unprotected branches |
 | Local kind | namespace-admin ServiceAccount, minted per launch, 8 h | one namespace, plain `kubectl` |
 | Client dev cluster | read-only ServiceAccount, minted per launch after impersonation proves it cannot mutate or read secrets, 8 h; held by a proxy sidecar, never by the jail | GET through the proxy (`kdev`) |
 
@@ -74,10 +74,13 @@ token. Identities, by design:
    `.git/config`, `.git/hooks` and `.git/commondir` read-only. Snapshots `notes/` (local git) and
    audits the repos for planted nested repositories before the session and again after it.
 4. Starts the jail's network namespace like a Kubernetes pod: a pause container on a per-stack
-   bridge (+ the kind network) that publishes the upload UI on a loopback port, and, if dev is
-   configured, a `kubectl proxy` sidecar in the same namespace that holds the dev token and serves
-   read-only on `127.0.0.1:8001`. Then it starts `claude` in that namespace with no bypass flag, and
-   removes the sidecars (saving the proxy's request log) when the session ends.
+   bridge (+ the kind network) that publishes the upload UI on a loopback port, plus the sidecars
+   in that namespace: the git proxy (`tools/gitproxy/`), which holds the GitHub and GitLab tokens,
+   forwards git smart-HTTP only and accepts pushes only for this stack's forks, on
+   `127.0.0.1:8002`; and, if dev is configured, a `kubectl proxy` that holds the dev token and
+   serves read-only on `127.0.0.1:8001`. Then it starts `claude` in that namespace with no git
+   token, no dev token and no bypass flag, and removes the sidecars (saving their request logs)
+   when the session ends.
    `tools/stack-jail-init.sh` builds the per-host git credential store, writes `~/.kube/kind.yaml`
    and a credential-less `~/.kube/dev.yaml`, and renders the session card.
 

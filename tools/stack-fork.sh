@@ -104,10 +104,14 @@ for r in $REPOS; do
     echo "   upstream: push disabled"
   fi
 
-  # 4. origin = fork
+  # 4. origin = fork. An existing origin may use any URL shape (https, scp-style ssh, ssh://): the
+  # host pushes with its own keys or helpers, and the jail rewrites every shape to its sidecar.
   want="https://github.com/$fork.git"
   if have=$(hgit "$dir" config --get remote.origin.url); then
-    [ "$(lc "$have")" = "$(lc "$want")" ] || echo "   ⚠ origin is $have (expected $want) — left as is" >&2
+    case "$(lc "$have")" in
+      *"github.com/$(lc "$fork")"|*"github.com/$(lc "$fork").git"|*"github.com:$(lc "$fork")"|*"github.com:$(lc "$fork").git") ;;
+      *) echo "   ⚠ origin is $have (expected $fork on github.com) — left as is" >&2 ;;
+    esac
   else
     hgit "$dir" remote add origin "$want"
     echo "   origin: $want"

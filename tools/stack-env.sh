@@ -15,6 +15,8 @@ if [ ! -f "$ENV_FILE" ]; then
   mkdir -p "$JAIL_HOME"
   ( umask 077; cat > "$ENV_FILE" <<EOT
 # $STACK jail — tokens + client FACTS. Gitignored; never copy values into any repo.
+# No git token below ever enters the jail: the launcher hands them to a sidecar that forwards git
+# smart-HTTP only and accepts pushes only for FORK_ORG/<repo> and GITLAB_FORK_PATH.
 # GitHub: fine-grained PAT, resource owner = your trust-domain org, All repositories,
 #   Contents R/W + Metadata, NO Pull requests. Reaches only the forks.
 GH_TOKEN=
