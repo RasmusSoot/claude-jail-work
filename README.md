@@ -57,7 +57,8 @@ token. Identities, by design:
 
 | Purpose | Credential | Reach |
 |---|---|---|
-| GitHub forks | fine-grained PAT, resource owner = your trust-domain org, Contents R/W + Metadata, no Pull requests; held by the git proxy sidecar, never by the jail | pushes to this stack's forks only (the sidecar's allowlist), fetches anywhere on github.com |
+| GitHub forks | fine-grained PAT, resource owner = your trust-domain org, Contents R/W + Metadata only (git needs nothing else, the sidecar exposes nothing else); held by the git proxy sidecar, never by the jail | pushes to this stack's forks only (the sidecar's allowlist), fetches anywhere on github.com |
+| GitHub API (`gh`), optional | fine-grained PAT, resource owner = you, public repositories only, no permissions; the one token that enters the jail, gated at launch (fine-grained, valid, sees no private repo). Only for stacks whose upstreams and forks are all public | authenticated rate limit for `gh` reads; every write refused by GitHub |
 | Client GitLab, read | personal token, `read_repository`; held by the sidecar | fetch upstream |
 | Client GitLab, write | deploy token, `write_repository`, on YOUR fork inside the client's GitLab, protected `main`; held by the sidecar | that fork's unprotected branches |
 | Local kind | namespace-admin ServiceAccount, minted per launch, 8 h | one namespace, plain `kubectl` |

@@ -28,6 +28,11 @@ if [ -n "${STACK_GITPROXY:-}" ]; then
 else
   _sj_git="no credential sidecar this session — public fetches only, every push fails."
 fi
+if [ -n "${GH_TOKEN:-}" ]; then
+  _sj_gh="\`gh\` is authenticated with a public-read-only token (fine-grained, public repositories, no permissions: it only buys the rate limit). Reads work; EVERY write (pr create/merge/comment, issues, releases) is refused by GitHub — those are the human's, from the host."
+else
+  _sj_gh="\`gh\` has no token here: public reads only, at the anonymous rate limit; every write fails. Pull requests and issues are the human's, from the host."
+fi
 
 # ── kubectl: two FILES, never two contexts in one ───────────────────────────────────────────────
 mkdir -p "$HOME/.kube"
@@ -75,6 +80,7 @@ export PATH="/workspace/tools:$PATH"                   # kdev
 - **Stack: ${STACK_NAME:-?}.** Mounted repos under \`/workspace\`: ${STACK_REPOS:-<none>}. Nothing else of the host is visible.
 - **Read-only views**: $(if [ -n "${STACK_READS:-}" ]; then echo "$(printf '%s' "${STACK_READS}" | tr ' ' '\n' | sed 's|\(.*\):\(.*\)|/reads/\1/\2|' | paste -sd, -) — other stacks' working trees as they are on the host, uncommitted edits included. Read, compare, cite; never try to write, build in, or push from them — their remotes and tokens are not in this jail."; else echo "none this session."; fi)
 - **git**: \`upstream\` is fetch-only; \`origin\` is YOUR fork. ${_sj_git} Pushes are the human's (\`! git push\`); add a Co-Authored-By trailer to commits you author.
+- **gh**: ${_sj_gh}
 - **kubectl (kind)**: ${_sj_kind}
 - **kdev (client dev)**: ${_sj_dev}
 - **notes**: \`/workspace/notes\` — the human's and agents' shared, persistent notes for this stack. Never committed to any repo or published; client facts are fine here. A local git repo with no remote: the launcher snapshots it before and after each session, so whatever you write is reviewed. Read it at the start of non-trivial work; write things meant to outlast this session.
@@ -85,7 +91,7 @@ EOT
   if [ -f /workspace/tools/jail-card.md ]; then cat /workspace/tools/jail-card.md; else _sj_warn "tools/jail-card.md missing"; echo "(ground-rules card missing)"; fi
 } > /workspace/CLAUDE.local.md 2>/dev/null || _sj_warn "could not write /workspace/CLAUDE.local.md"
 
-unset _sj_kind _sj_dev _sj_git
+unset _sj_kind _sj_dev _sj_git _sj_gh                 # GH_TOKEN stays: it is gh's, public-read-only, gated by the launcher
 unset STACK_KUBE_TOKEN STACK_KUBE_CA
 unset -f _sj_warn _sj_kubeconfig _sj_route 2>/dev/null
 true

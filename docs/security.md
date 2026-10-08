@@ -27,6 +27,11 @@ on a credential staying secret. Instead every credential is classed by what its 
 - **A day** (the per-launch tokens; 8 h or 24 h are the same class, a workday): may enter a jail
   only if its scope is acceptable in an attacker's hands for that day. Today only the kind token
   qualifies, and it is useless outside the host.
+- **Harmless** (a token whose leak grants nothing anyone lacks): may enter a jail at any lifetime.
+  The one example is the optional `gh` token, a fine-grained PAT with public-repository access and
+  no permissions; it buys the authenticated rate limit and nothing else, and the launcher refuses it
+  unless it can see no private repository. It is only valid for stacks whose upstreams and forks
+  are all public.
 - **Anything else** lives in a sidecar in the jail's network namespace that holds the token and
   enforces policy for whoever calls it: the dev cluster token and all git tokens.
 
@@ -183,6 +188,12 @@ token through a single-file mount of `.credentials.json`.
 - **`jail-main` holds `GH_TOKEN` directly** (`.env`, credential store in `tools/jail-entrypoint.sh`):
   it has no pod namespace and no sidecar. Accepted for now because it sees only this repo, no
   client content to be steered by; the token's scope is still the fork org.
+- **`gh` in a stack jail is a read tool with a public-only token, or unauthenticated.** The
+  harmless-class token above is in the jail's environment on purpose. Its permission set cannot be
+  probed without writing, so "no permissions" rests on the human's token setup; the gate only
+  proves it is fine-grained, valid and blind to private repositories. Without it, `gh` still answers
+  public reads at the anonymous rate limit, which is throttled at random times. Either way every
+  write is refused by GitHub, not by anything in the jail.
 - **Every jail holds the Anthropic OAuth credentials**, read-write for token refresh. A compromised
   jail has the account session.
 - **Build inputs are latest-at-build-time** (devbox install script, the Claude Code native
@@ -199,3 +210,19 @@ token through a single-file mount of `.credentials.json`.
 - **kind Pod Security label.** The launcher now refuses the kind token without it (see above), but
   the label itself (`pod-security.kubernetes.io/enforce: baseline` on each stack namespace) still
   has to be added where the SA and RoleBinding live, in the lab repo.
+- **Read-only API access through the sidecar (`gh`, later `glab`) for stacks with private
+  repos.** The public-only `gh` token stops being harmless the moment a fork or upstream is
+  private. The design that keeps `gh` working natively is an *explicit* proxy: the sidecar also
+  serves as `HTTPS_PROXY` for the jail; it tunnels `CONNECT` blindly for every host except the git
+  hosts and `api.github.com`, which it terminates with a per-launch CA the launcher generates (the
+  jail trusts it through `SSL_CERT_FILE`, `GIT_SSL_CAINFO`, `NODE_EXTRA_CA_CERTS`,
+  `REQUESTS_CA_BUNDLE`; Java ignores all of them and goes direct, credential-less, as now). Policy
+  on `api.github.com`: GET only on REST, and GraphQL POST only when the document contains no
+  `mutation`, which keeps `pr list/view/checks`, `run view --log` and `gh api` reads and refuses
+  `pr create/merge`, comments and every other write. The jail gets a dummy `GH_TOKEN` so `gh`
+  believes it is logged in; the sidecar drops it and adds the real one. `gh`'s only plain-HTTP
+  mode (`GH_HOST=github.localhost`) was rejected: its repo detection reads the raw remote URLs,
+  so every in-repo command would need `-R`. Cost: ~200 lines in `gitproxy.py`, CA plumbing in the
+  launcher and init; `url.insteadOf` becomes unnecessary since git can use its real URLs through
+  the same proxy. Side effect: the sidecar log becomes an egress log for everything that honours
+  the proxy env.

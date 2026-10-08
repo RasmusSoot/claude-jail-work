@@ -406,11 +406,38 @@ fi
 unset GH_TOKEN GITLAB_READ_TOKEN GITLAB_DEPLOY_USER GITLAB_DEPLOY_TOKEN
 export STACK_GITPROXY GITPROXY_WRITE
 
+# ── gh: the one token that may enter the jail, because its leak must be harmless ─────────────────
+# A fine-grained PAT with "Public repositories" access and no permissions grants nothing anyone
+# lacks, only the authenticated rate limit for gh reads. Gate before injecting: fine-grained shape
+# (classic tokens cannot be verified this way), valid, and it sees NO private repository. The
+# permission set itself cannot be probed without writing; that part is the human's.
+GH_JAIL_TOKEN=""
+if [ -n "${GH_PUBLIC_TOKEN:-}" ]; then
+  gh_api() { curl -sS --max-time 15 -H "Authorization: Bearer $GH_PUBLIC_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/$1" 2>>"$ERR_DIR/gh-public.err"; }
+  case "$GH_PUBLIC_TOKEN" in github_pat_*) ;; *) echo "ABORT gh: GH_PUBLIC_TOKEN is not a fine-grained token (github_pat_…) — NOT installed" >&2; GH_PUBLIC_TOKEN=unverifiable ;; esac
+  if [ "$GH_PUBLIC_TOKEN" != unverifiable ]; then
+    login=$(gh_api user | jq -r '.login // empty')
+    private=$(gh_api 'user/repos?visibility=private&per_page=1' | jq -r 'if type == "array" then length else "?" end')
+    if [ -z "$login" ]; then
+      echo "ABORT gh: GH_PUBLIC_TOKEN is not valid (GET /user failed) — NOT installed" >&2; sed 's/^/    /' "$ERR_DIR/gh-public.err" >&2
+    elif [ "$private" != 0 ]; then
+      echo "ABORT gh: GH_PUBLIC_TOKEN can see private repositories (or the probe failed: '$private') — NOT installed" >&2
+    else
+      GH_JAIL_TOKEN="$GH_PUBLIC_TOKEN"
+      echo "→ gh: public-read-only token for $login enters the jail (authenticated rate limit; writes are refused by GitHub)"
+    fi
+  fi
+else
+  echo "→ gh: no GH_PUBLIC_TOKEN in $ENV_FILE — gh is unauthenticated in the jail (anonymous rate limit)"
+fi
+unset GH_PUBLIC_TOKEN
+export GH_JAIL_TOKEN
+
 # Not exec: the EXIT trap has to remove the holder + sidecars (and save their logs) afterwards.
 docker compose -f "$HERE/docker-compose.yml" run --rm \
   "${VOLS[@]}" \
   -e STACK_NAME -e JAIL_NAME -e JAIL_READS -e STACK_REPOS -e STACK_READS -e UPLOAD_DIR -e UPLOAD_HOST_PORT \
-  -e STACK_GITPROXY -e GITPROXY_WRITE -e GITLAB_HOST -e GITLAB_FORK_PATH -e FORK_ORG \
+  -e STACK_GITPROXY -e GITPROXY_WRITE -e GITLAB_HOST -e GITLAB_FORK_PATH -e FORK_ORG -e GH_TOKEN="$GH_JAIL_TOKEN" \
   -e STACK_KUBE_TOKEN -e STACK_KUBE_SERVER -e STACK_KUBE_CA -e STACK_KUBE_NS -e STACK_KUBE_SA \
   -e STACK_DEVKUBE_PROXY -e STACK_DEVKUBE_NS -e STACK_DEVKUBE_SA \
   stack \
