@@ -15,17 +15,17 @@ if [ ! -f "$ENV_FILE" ]; then
   mkdir -p "$JAIL_HOME"
   ( umask 077; cat > "$ENV_FILE" <<EOT
 # $STACK jail — tokens + client FACTS. Gitignored; never copy values into any repo.
-# No git token below ever enters the jail: the launcher hands them to a sidecar that forwards git
-# smart-HTTP only and accepts pushes only for FORK_ORG/<repo> and GITLAB_FORK_PATH.
-# GitHub (git): fine-grained PAT, resource owner = your trust-domain org, All repositories,
-#   Contents R/W + Metadata only — git needs nothing else and the sidecar exposes nothing else.
-GH_TOKEN=
 # GitHub (gh, optional): the ONE token that enters the jail, so it must be harmless if leaked —
 #   fine-grained PAT, resource owner = you, "Public repositories" only, NO permissions. It buys
 #   the authenticated rate limit for gh reads; every write is refused by GitHub. The launcher
 #   refuses it unless it is a fine-grained token that sees no private repository. Only for stacks
 #   whose upstreams and forks are all public.
 GH_PUBLIC_TOKEN=
+# No git token below ever enters the jail: the launcher hands them to a sidecar that forwards git
+# smart-HTTP only and accepts pushes only for FORK_ORG/<repo> and GITLAB_FORK_PATH.
+# GitHub (git): fine-grained PAT, resource owner = your trust-domain org, All repositories,
+#   Contents R/W + Metadata only — git needs nothing else and the sidecar exposes nothing else.
+GH_TOKEN=
 # Repo setup (tools/stack-fork.sh): upstream owner + the trust-domain org that holds the forks.
 UPSTREAM_OWNER=
 FORK_ORG=
