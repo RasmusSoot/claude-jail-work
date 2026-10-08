@@ -2,10 +2,14 @@
 """gitproxy — the git credential sidecar. Stdlib only.
 
 Runs in the jail's network namespace and listens on its loopback. The jail's git talks plain HTTP to
-    http://127.0.0.1:8002/<host>/<owner>/<repo>.git/...
-and this proxy forwards to https://<host>/<owner>/<repo>.git/... with the credential for that host
-and path. No git token is ever inside the jail; the jail's ~/.gitconfig routes every URL shape of
-each host here with url.<base>.insteadOf (tools/stack-jail-init.sh).
+    http://www.<host>:8002/<owner>/<repo>.git/...
+where www.<host> resolves to 127.0.0.1 inside the namespace (an /etc/hosts entry on the pause
+container), and this proxy forwards to https://<host>/<owner>/<repo>.git/... with the credential
+for that host and path. The upstream is chosen by the Host header, from a fixed list. The "www."
+name is what makes `gh` work in a repo directory: `git remote -v` shows insteadOf-rewritten URLs,
+and gh normalises www.github.com to github.com but would treat 127.0.0.1 as an unknown host.
+No git token is ever inside the jail; the jail's ~/.gitconfig routes every URL shape of each host
+here with url.<base>.insteadOf (tools/stack-jail-init.sh).
 
 Policy, enforced for ANY client in the namespace (git, curl, a repo's own scripts):
   - hosts: github.com always (anonymously when there is no token), GITLAB_HOST if set; others 404
@@ -55,7 +59,7 @@ GITLAB_FORK_PATH = os.environ.get("GITLAB_FORK_PATH", "")
 GITLAB_DEPLOY_USER = os.environ.get("GITLAB_DEPLOY_USER", "") or "gitlab+deploy-token"
 GITLAB_DEPLOY_TOKEN = os.environ.get("GITLAB_DEPLOY_TOKEN", "")
 
-ROUTE = re.compile(r"^/([^/]+)/(.+?)/(info/refs|git-upload-pack|git-receive-pack)$")
+ROUTE = re.compile(r"^/(.+?)/(info/refs|git-upload-pack|git-receive-pack)$")
 SERVICES = {"git-upload-pack", "git-receive-pack"}
 # Hop-by-hop and proxy-owned request headers: never forwarded as received.
 DROP_REQ = {
@@ -84,11 +88,25 @@ def norm(path: str) -> str:
     return path[:-4] if path.endswith(".git") else path
 
 
+def hostname(addr: str) -> str:
+    """'Host:port' -> 'host', lowercase, without a 'www.' prefix."""
+    h = addr.rpartition(":")[0] if ":" in addr and not addr.endswith("]") else addr
+    h = h.lower()
+    return h[4:] if h.startswith("www.") else h
+
+
 def listing(var: str) -> set[str]:
-    return {norm(e) for e in os.environ.get(var, "").split(",") if e.strip()}
+    out = set()
+    for e in os.environ.get(var, "").split(","):
+        if e.strip():
+            h, _, p = e.strip().partition("/")
+            out.add(f"{hostname(h)}/{norm(p)}")
+    return out
 
 
-HOSTS = {h for h in ("github.com", GITLAB_HOST) if h}
+# Served hostname (what the jail's Host header names, minus www.) -> upstream address (may carry a port).
+UPSTREAMS = {hostname(h): h for h in ("github.com", GITLAB_HOST) if h}
+GITLAB = hostname(GITLAB_HOST) if GITLAB_HOST else ""
 WRITE = listing("GITPROXY_WRITE")
 READ = listing("GITPROXY_READ") | WRITE
 
@@ -96,7 +114,7 @@ READ = listing("GITPROXY_READ") | WRITE
 def credential(host: str, repo: str) -> tuple[str, str] | None:
     if host == "github.com":
         return ("x-access-token", GH_TOKEN) if GH_TOKEN and f"{host}/{norm(repo)}" in READ else None
-    if host == GITLAB_HOST:
+    if host == GITLAB:
         if GITLAB_DEPLOY_TOKEN and GITLAB_FORK_PATH and norm(repo) == norm(GITLAB_FORK_PATH):
             return GITLAB_DEPLOY_USER, GITLAB_DEPLOY_TOKEN
         if GITLAB_READ_TOKEN:
@@ -161,12 +179,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_git(self, method: str) -> None:
         url = urllib.parse.urlsplit(self.path)
+        host = hostname(self.headers.get("Host", ""))
         m = ROUTE.match(url.path)
         if not m:
-            return self.refuse(404, "not a git smart-HTTP endpoint", url.path)
-        host, repo, endpoint = m.group(1).lower(), m.group(2), m.group(3)
-        if host not in HOSTS:
+            return self.refuse(404, "not a git smart-HTTP endpoint", host, url.path)
+        repo, endpoint = m.group(1), m.group(2)
+        if host not in UPSTREAMS:
             return self.refuse(404, "host not served here", host, repo)
+        upstream = UPSTREAMS[host]
         if endpoint == "info/refs":
             if method != "GET":
                 return self.refuse(405, "info/refs is GET", host, repo)
@@ -194,9 +214,9 @@ class Handler(BaseHTTPRequestHandler):
         conn = None
         try:
             if SCHEME == "https":
-                conn = http.client.HTTPSConnection(host, timeout=600, context=TLS)
+                conn = http.client.HTTPSConnection(upstream, timeout=600, context=TLS)
             else:
-                conn = http.client.HTTPConnection(host, timeout=600)
+                conn = http.client.HTTPConnection(upstream, timeout=600)
             if method == "POST":
                 conn.request("POST", target, body=self.body(), headers=headers, encode_chunked="Content-Length" not in headers)
             else:
@@ -213,8 +233,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.refuse(403, "upstream refused the proxy's credential", host, repo, service, "upstream=401")
             self.send_response(resp.status)
             for k, v in resp.getheaders():
-                if k.lower() == "location" and v.startswith(f"{SCHEME}://{host}/"):
-                    v = f"http://{self.headers.get('Host', LISTEN)}/{host}/" + v[len(f"{SCHEME}://{host}/") :]
+                if k.lower() == "location" and v.startswith(f"{SCHEME}://{upstream}/"):
+                    v = f"http://{self.headers.get('Host', LISTEN)}/" + v[len(f"{SCHEME}://{upstream}/") :]
                 if k.lower() not in DROP_RESP:
                     self.send_header(k, v)
             length = resp.getheader("Content-Length")
@@ -254,7 +274,7 @@ def main() -> int:
     srv = ThreadingHTTPServer((host, int(port)), Handler)
     srv.daemon_threads = True
     log(
-        f"gitproxy: serving {LISTEN} for {' '.join(sorted(HOSTS))}; github.com token for: {' '.join(sorted(READ)) or '<none>'};"
+        f"gitproxy: serving {LISTEN} as www.<host> for {' '.join(sorted(UPSTREAMS))}; github.com token for: {' '.join(sorted(READ)) or '<none>'};"
         f" push allowed to: {' '.join(sorted(WRITE)) or '<none>'}"
     )
     try:

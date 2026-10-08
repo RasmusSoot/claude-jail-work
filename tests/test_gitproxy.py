@@ -130,9 +130,13 @@ class GitProxyTest(unittest.TestCase):
     def setUp(self):
         Upstream.seen.clear()
 
-    def request(self, method: str, path: str, body=None, headers=None, **kw):
+    def request(self, method: str, path: str, body=None, headers=None, host=None, **kw):
+        """A request as the jail's git would send it: to loopback, with Host: www.<upstream host>:<port>.
+        `path` may be '/<host>/<repo>...' to pick another Host, as in the real jail's URL shape."""
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        conn.request(method, path, body=body, headers=headers or {}, **kw)
+        default_host = f"www.{self.up_host.partition(':')[0]}:{self.port}"
+        hdrs = {"Host": default_host if host is None else host, **(headers or {})}
+        conn.request(method, path, body=body, headers=hdrs, **kw)
         resp = conn.getresponse()
         data = resp.read()
         conn.close()
@@ -143,7 +147,7 @@ class GitProxyTest(unittest.TestCase):
 
     # ── transformation ───────────────────────────────────────────────────────────────────────
     def test_fetch_is_forwarded_with_the_read_token(self):
-        resp, data = self.request("GET", f"/{self.up_host}/group/upstream.git/info/refs?service=git-upload-pack")
+        resp, data = self.request("GET", "/group/upstream.git/info/refs?service=git-upload-pack")
         self.assertEqual(resp.status, 200)
         self.assertEqual(data, ADVERT)
         self.assertEqual(resp.getheader("Content-Type"), "application/x-git-upload-pack-advertisement")
@@ -152,14 +156,14 @@ class GitProxyTest(unittest.TestCase):
         self.assertEqual(self.auth(), "Basic b2F1dGgyOnJlYWQtc2VjcmV0LVRPS0VO")  # oauth2:read-secret-TOKEN
 
     def test_push_to_the_fork_uses_the_deploy_token(self):
-        resp, data = self.request("POST", f"/{self.up_host}/ME/Fork.GIT/git-receive-pack", body=b"pack-bytes")
+        resp, data = self.request("POST", "/ME/Fork.GIT/git-receive-pack", body=b"pack-bytes")
         self.assertEqual(resp.status, 200)
         self.assertEqual(data, b"echo:pack-bytes")
         self.assertEqual(Upstream.seen[0]["path"], "/ME/Fork.GIT/git-receive-pack")
         self.assertEqual(self.auth(), "Basic ZGVwbG95ZXI6ZGVwbG95LXNlY3JldC1UT0tFTg==")  # deployer:deploy-secret-TOKEN
 
     def test_client_authorization_is_replaced_not_forwarded(self):
-        self.request("GET", f"/{self.up_host}/x/y.git/info/refs?service=git-upload-pack", headers={"Authorization": "Basic ZXZpbDpldmls"})
+        self.request("GET", "/x/y.git/info/refs?service=git-upload-pack", headers={"Authorization": "Basic ZXZpbDpldmls"})
         self.assertNotIn("ZXZpbDpldmls", self.auth())
         self.assertTrue(self.auth().startswith("Basic "))
 
@@ -167,7 +171,7 @@ class GitProxyTest(unittest.TestCase):
         parts = [b"0032want ", b"a" * 40, b"\n", b"0000", b"0009done\n"]
         resp, data = self.request(
             "POST",
-            f"/{self.up_host}/x/y.git/git-upload-pack",
+            "/x/y.git/git-upload-pack",
             body=iter(parts),
             encode_chunked=True,
             headers={"Content-Type": "application/x-git-upload-pack-request"},
@@ -178,57 +182,67 @@ class GitProxyTest(unittest.TestCase):
         self.assertEqual(Upstream.seen[0]["headers"].get("Content-Type"), "application/x-git-upload-pack-request")
 
     def test_redirect_location_points_back_at_the_proxy(self):
-        resp, _ = self.request("GET", f"/{self.up_host}/moved/repo.git/info/refs?service=git-upload-pack")
+        resp, _ = self.request("GET", "/moved/repo.git/info/refs?service=git-upload-pack")
         self.assertEqual(resp.status, 301)
-        self.assertEqual(resp.getheader("Location"), f"http://127.0.0.1:{self.port}/{self.up_host}/new/repo.git/info/refs?service=git-upload-pack")
+        self.assertEqual(resp.getheader("Location"), f"http://www.{self.up_host.partition(':')[0]}:{self.port}/new/repo.git/info/refs?service=git-upload-pack")
 
     # ── policy ───────────────────────────────────────────────────────────────────────────────
     def test_push_elsewhere_is_refused_before_upstream(self):
         for path in (
-            f"/{self.up_host}/group/upstream.git/info/refs?service=git-receive-pack",
-            f"/{self.up_host}/group/upstream.git/git-receive-pack",
-            f"/{self.up_host}/me/fork/../upstream.git/git-receive-pack",
-            f"/{self.up_host}/me/fork.git/evil.git/git-receive-pack",
+            "/group/upstream.git/info/refs?service=git-receive-pack",
+            "/group/upstream.git/git-receive-pack",
+            "/me/fork/../upstream.git/git-receive-pack",
+            "/me/fork.git/evil.git/git-receive-pack",
         ):
             resp, _ = self.request("POST" if path.endswith("/git-receive-pack") else "GET", path, body=b"x")
             self.assertEqual(resp.status, 403, path)
         self.assertEqual(Upstream.seen, [])
 
     def test_duplicate_service_params_use_the_first_and_the_query_is_rebuilt(self):
-        resp, _ = self.request("GET", f"/{self.up_host}/x/y.git/info/refs?service=git-upload-pack&service=git-receive-pack&extra=1")
+        resp, _ = self.request("GET", "/x/y.git/info/refs?service=git-upload-pack&service=git-receive-pack&extra=1")
         self.assertEqual(resp.status, 200)
         self.assertEqual(Upstream.seen[0]["path"], "/x/y.git/info/refs?service=git-upload-pack")
 
     def test_upstream_401_becomes_403(self):
-        resp, _ = self.request("GET", f"/{self.up_host}/needs-auth/repo.git/info/refs?service=git-upload-pack")
+        resp, _ = self.request("GET", "/needs-auth/repo.git/info/refs?service=git-upload-pack")
         self.assertEqual(resp.status, 403)
         self.assertEqual(len(Upstream.seen), 1)
 
     def test_non_git_paths_and_unknown_hosts_are_404(self):
         for path in (
-            f"/{self.up_host}/me/fork.git/HEAD",
-            f"/{self.up_host}/api/v4/user",
-            f"/{self.up_host}/me/fork.git/info/lfs/objects/batch",
-            "/evil.example/me/fork.git/info/refs?service=git-upload-pack",
-            f"/{self.up_host}./x.git/info/refs?service=git-upload-pack",
+            "/me/fork.git/HEAD",
+            "/api/v4/user",
+            "/me/fork.git/info/lfs/objects/batch",
         ):
             resp, _ = self.request("GET", path)
             self.assertIn(resp.status, (403, 404), path)
+        for host in ("www.evil.example", "evil.example", "github.com.evil.example", f"www.{self.up_host.partition(':')[0]}.evil", ""):
+            resp, _ = self.request("GET", "/me/fork.git/info/refs?service=git-upload-pack", host=host)
+            self.assertEqual(resp.status, 404, host)
         self.assertEqual(Upstream.seen, [])
 
+    def test_host_is_taken_from_the_host_header_with_or_without_www(self):
+        for host in (
+            f"www.{self.up_host.partition(':')[0]}:{self.port}",
+            f"{self.up_host.partition(':')[0]}:{self.port}",
+            f"WWW.{self.up_host.partition(':')[0]}",
+        ):
+            resp, data = self.request("GET", "/x/y.git/info/refs?service=git-upload-pack", host=host)
+            self.assertEqual((resp.status, data), (200, ADVERT), host)
+
     def test_refusal_closes_the_connection_explicitly(self):
-        resp, _ = self.request("POST", f"/{self.up_host}/other/repo.git/git-receive-pack", body=b"x")
+        resp, _ = self.request("POST", "/other/repo.git/git-receive-pack", body=b"x")
         self.assertEqual(resp.status, 403)
         self.assertEqual(resp.getheader("Connection"), "close")
 
     def test_no_duplicate_server_or_date_headers(self):
-        resp, _ = self.request("GET", f"/{self.up_host}/x/y.git/info/refs?service=git-upload-pack")
+        resp, _ = self.request("GET", "/x/y.git/info/refs?service=git-upload-pack")
         for name in ("Server", "Date"):
             self.assertEqual(len([k for k, _ in resp.getheaders() if k.lower() == name.lower()]), 1, name)
 
     def test_truncated_upstream_body_closes_instead_of_hanging(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        conn.request("GET", f"/{self.up_host}/truncate/repo.git/info/refs?service=git-upload-pack")
+        conn.request("GET", "/truncate/repo.git/info/refs?service=git-upload-pack")
         resp = conn.getresponse()
         self.assertEqual((resp.status, resp.getheader("Content-Length")), (200, "100"))
         # The proxy must close after the short body: http.client then raises IncompleteRead at once.
@@ -238,17 +252,17 @@ class GitProxyTest(unittest.TestCase):
         conn.close()
 
     def test_only_get_and_post(self):
-        resp, _ = self.request("HEAD", f"/{self.up_host}/me/fork.git/info/refs?service=git-upload-pack")
+        resp, _ = self.request("HEAD", "/me/fork.git/info/refs?service=git-upload-pack")
         self.assertEqual(resp.status, 501)
-        resp, _ = self.request("POST", f"/{self.up_host}/me/fork.git/info/refs?service=git-upload-pack", body=b"x")
+        resp, _ = self.request("POST", "/me/fork.git/info/refs?service=git-upload-pack", body=b"x")
         self.assertEqual(resp.status, 405)
-        resp, _ = self.request("GET", f"/{self.up_host}/me/fork.git/git-upload-pack")
+        resp, _ = self.request("GET", "/me/fork.git/git-upload-pack")
         self.assertEqual(resp.status, 405)
         self.assertEqual(Upstream.seen, [])
 
     def test_serves_again_after_a_refusal(self):
-        self.request("POST", f"/{self.up_host}/other/repo.git/git-receive-pack", body=b"x")
-        resp, data = self.request("GET", f"/{self.up_host}/other/repo.git/info/refs?service=git-upload-pack")
+        self.request("POST", "/other/repo.git/git-receive-pack", body=b"x")
+        resp, data = self.request("GET", "/other/repo.git/info/refs?service=git-upload-pack")
         self.assertEqual((resp.status, data), (200, ADVERT))
 
 
@@ -292,7 +306,7 @@ class CredentialSelectionTest(unittest.TestCase):
         self.assertIsNone(cred("other.example", "me/fork"))
 
     def test_hosts_and_lists(self):
-        self.assertEqual(self.gp.HOSTS, {"github.com", "gl.example"})
+        self.assertEqual(self.gp.UPSTREAMS, {"github.com": "github.com", "gl.example": "gl.example"})
         self.assertEqual(self.gp.WRITE, {"github.com/forkorg/repo", "gl.example/me/fork"})
         self.assertEqual(self.gp.READ, {"github.com/upstream/repo", "github.com/forkorg/repo", "gl.example/me/fork"})
 

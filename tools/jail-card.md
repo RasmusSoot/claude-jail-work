@@ -20,12 +20,14 @@ human pushes.
   `push -u`, `remote add` and `branch --set-upstream-to` fail by design — push without `-u`.
   There is no git token in a stack jail: a credential sidecar on loopback adds it, forwards git
   smart-HTTP only (no GitHub/GitLab API), and refuses pushes to anything but the stack's forks.
-  `git remote -v` shows the configured URL, `git ls-remote --get-url origin` the one actually used.
-  A 403 from it is the policy, not a bug; do not look for another route.
-- **gh**: a read tool here. The only token it may have is public-read-only (it buys the rate
-  limit, nothing else), so `gh pr list`, `gh pr view`, `gh run view`, `gh api` reads work and every
-  write is refused by GitHub. Pull requests, comments, issues and releases are the human's, from
-  the host. The session card says which of the two states this session is in.
+  Remotes show as `http://www.<host>:<port>/<owner>/<repo>.git` in `git remote -v`: that name is
+  the sidecar (it resolves to loopback here), not a typo and not a different repo. A 403 from it is
+  the policy, not a bug; do not look for another route.
+- **gh**: a read tool here, and it works in a repo directory without `-R`. The only token it may
+  have is public-read-only (it buys the rate limit, nothing else), so `gh pr list`, `gh pr view`,
+  `gh run view`, `gh api` reads work and every write is refused by GitHub. Without that token `gh`
+  refuses to run at all. Pull requests, comments, issues and releases are the human's, from the
+  host. The session card says which of the two states this session is in.
 - **kubectl**: plain `kubectl` is the LOCAL KIND cluster (namespace-admin, disposable — destructive
   verbs are fine there). `kdev` is the CLIENT DEV cluster, read-only through a proxy that holds the
   token (no credential is in this jail): anything but GET, and any secrets, exec, attach,

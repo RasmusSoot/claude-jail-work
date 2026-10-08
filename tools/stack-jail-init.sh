@@ -8,30 +8,35 @@ _sj_warn() { echo "stack-jail-init: $*" >&2; }
 
 # ── git identity + routing through the credential sidecar ───────────────────────────────────────
 # No token and no credential helper in here. Every URL shape of github.com and the client GitLab
-# (https, http, scp-style ssh, ssh://) is rewritten to the gitproxy sidecar on the namespace's
-# loopback, which adds the credential and enforces the push allowlist. Repo configs stay as the host
-# wrote them (and are read-only), so the host keeps using its own remotes, SSH keys and helpers.
-# `git remote -v` shows the configured URL; `git ls-remote --get-url origin` shows the rewritten one.
+# (https, http, scp-style ssh, ssh://) is rewritten to http://www.<host>:<port>/, which is the
+# gitproxy sidecar: www.<host> resolves to the namespace's loopback (/etc/hosts of the namespace
+# holder), and the sidecar adds the credential and enforces the push allowlist. Repo configs stay
+# as the host wrote them (and are read-only), so the host keeps its own remotes, keys and helpers.
+# `git remote -v` shows the REWRITTEN URL (insteadOf applies there); `git config --get
+# remote.origin.url` shows the configured one. The "www." form is what keeps `gh` working in a repo
+# directory: it normalises www.github.com to github.com, while 127.0.0.1 is an unknown host to it.
 if [ -f /home/claude/.gitconfig-base ]; then cp /home/claude/.gitconfig-base "$HOME/.gitconfig"; else _sj_warn "no .gitconfig-base — set user.name/email"; fi
 git config --global remote.pushDefault origin        # triangular: track upstream, push to the fork
 git config --global push.default current
 if [ -n "${STACK_GITPROXY:-}" ]; then
-  _sj_route() { # <host>
-    local u; for u in "https://$1/" "http://$1/" "git@$1:" "ssh://git@$1/"; do
-      git config --global --add "url.$STACK_GITPROXY/$1/.insteadOf" "$u"
+  _sj_route() { # <host>: every URL shape of <host> -> http://www.<host>:<port>/
+    local h="${1%%:*}" u
+    for u in "https://$1/" "http://$1/" "https://www.$h/" "git@$1:" "ssh://git@$1/"; do
+      git config --global --add "url.http://www.$h:$STACK_GITPROXY/.insteadOf" "$u"
     done
+    getent hosts "www.$h" 2>/dev/null | grep -q '^127\.0\.0\.1 ' || _sj_warn "www.$h does not resolve to loopback — git to $1 will NOT reach the sidecar"
   }
   _sj_route github.com
   [ -n "${GITLAB_HOST:-}" ] && _sj_route "$GITLAB_HOST"
   export GIT_TERMINAL_PROMPT=0                       # a refused request fails; nothing here could answer a prompt
-  _sj_git="GitHub${GITLAB_HOST:+ and GitLab} traffic goes through a credential sidecar (no git token in this jail; git smart-HTTP only, so no API access). Pushes are accepted ONLY to: ${GITPROXY_WRITE:-<none>}."
+  _sj_git="GitHub${GITLAB_HOST:+ and GitLab} traffic goes through a credential sidecar (no git token in this jail; git smart-HTTP only, so no API access): remotes show as \`http://www.<host>:$STACK_GITPROXY/…\`, which is that sidecar. Pushes are accepted ONLY to: ${GITPROXY_WRITE:-<none>}."
 else
   _sj_git="no credential sidecar this session — public fetches only, every push fails."
 fi
 if [ -n "${GH_TOKEN:-}" ]; then
-  _sj_gh="\`gh\` is authenticated with a public-read-only token (fine-grained, public repositories, no permissions: it only buys the rate limit). Reads work; EVERY write (pr create/merge/comment, issues, releases) is refused by GitHub — those are the human's, from the host."
+  _sj_gh="\`gh\` is authenticated with a public-read-only token (fine-grained, public repositories, no permissions: it only buys the rate limit) and works in a repo directory without \`-R\`. Reads work; EVERY write (pr create/merge/comment, issues, releases) is refused by GitHub — those are the human's, from the host."
 else
-  _sj_gh="\`gh\` has no token here: public reads only, at the anonymous rate limit; every write fails. Pull requests and issues are the human's, from the host."
+  _sj_gh="\`gh\` has no token here and refuses to run without one. Pull requests and issues are the human's, from the host."
 fi
 
 # ── kubectl: two FILES, never two contexts in one ───────────────────────────────────────────────

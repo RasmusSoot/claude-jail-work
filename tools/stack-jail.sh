@@ -336,7 +336,12 @@ trap on_exit EXIT
 cleanup                                                           # leftovers of a crashed launch (ERR_DIR stays: the sidecar + gh gates below still write there)
 
 docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
-docker run -d --rm --name "$NETNS" --network "$NET" "${PORTS[@]}" "${SIDECAR[@]}" "$PAUSE_IMAGE" >/dev/null
+# The git sidecar is addressed as www.<host>:8002 (see tools/gitproxy/gitproxy.py for why "www."):
+# /etc/hosts belongs to the namespace holder and is shared by everything that joins it.
+GITPROXY_PORT=8002
+HOSTS_ADD=(--add-host "www.github.com:127.0.0.1")
+[ -z "${GITLAB_HOST:-}" ] || HOSTS_ADD+=(--add-host "www.${GITLAB_HOST%%:*}:127.0.0.1")
+docker run -d --rm --name "$NETNS" --network "$NET" "${PORTS[@]}" "${HOSTS_ADD[@]}" "${SIDECAR[@]}" "$PAUSE_IMAGE" >/dev/null
 if [ -n "$KIND_CLUSTER" ] && docker network inspect "$KIND_NET" >/dev/null 2>&1; then   # reach, not access
   docker network connect "$KIND_NET" "$NETNS" || echo "⚠ could not join docker network '$KIND_NET' — kind unreachable" >&2
 fi
@@ -396,7 +401,7 @@ if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITLAB_HOST:-}" ]; then
   fi
   [ -n "${GITLAB_HOST:-}" ] && [ -n "${GITLAB_FORK_PATH:-}" ] && GITPROXY_WRITE="$GITPROXY_WRITE,$GITLAB_HOST/$GITLAB_FORK_PATH"
   GITPROXY_WRITE="${GITPROXY_WRITE#,}"; GITPROXY_READ="${GITPROXY_READ#,}"
-  export GITPROXY_WRITE GITPROXY_READ GITPROXY_LISTEN="127.0.0.1:8002" GH_TOKEN GITLAB_HOST GITLAB_READ_TOKEN GITLAB_FORK_PATH GITLAB_DEPLOY_USER GITLAB_DEPLOY_TOKEN
+  export GITPROXY_WRITE GITPROXY_READ GITPROXY_LISTEN="127.0.0.1:$GITPROXY_PORT" GH_TOKEN GITLAB_HOST GITLAB_READ_TOKEN GITLAB_FORK_PATH GITLAB_DEPLOY_USER GITLAB_DEPLOY_TOKEN
   docker compose -f "$HERE/docker-compose.yml" run -d --name "$GITPROXY" \
     -e GITPROXY_LISTEN -e GITPROXY_WRITE -e GITPROXY_READ -e GH_TOKEN -e GITLAB_HOST -e GITLAB_READ_TOKEN \
     -e GITLAB_FORK_PATH -e GITLAB_DEPLOY_USER -e GITLAB_DEPLOY_TOKEN gitproxy >/dev/null 2>"$ERR_DIR/gitproxy.err" || true
@@ -406,7 +411,7 @@ if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITLAB_HOST:-}" ]; then
     sleep 0.2
   done
   if docker logs "$GITPROXY" 2>&1 | grep -q 'gitproxy: serving'; then
-    STACK_GITPROXY="http://$GITPROXY_LISTEN"
+    STACK_GITPROXY="$GITPROXY_PORT"                                 # the jail reaches it as http://www.<host>:<port>/
     echo "→ git: credential sidecar up in the jail's namespace (tokens stay in $GITPROXY; GitHub token only for: ${GITPROXY_READ:-<none>} + forks; pushes only to: ${GITPROXY_WRITE:-<none>}; audit log → $RUN_DIR/)"
   else
     echo "⚠ git: sidecar did not start — the session has NO git credential (public fetches only). It said:" >&2

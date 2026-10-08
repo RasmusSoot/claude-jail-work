@@ -83,7 +83,9 @@ token. Identities, by design:
    bridge (+ the kind network) that publishes the upload UI on a loopback port, plus the sidecars
    in that namespace: the git proxy (`tools/gitproxy/`), which holds the GitHub and GitLab tokens,
    forwards git smart-HTTP only and accepts pushes only for this stack's forks, on
-   `127.0.0.1:8002`; and, if dev is configured, a `kubectl proxy` that holds the dev token and
+   `127.0.0.1:8002`, reached as `www.github.com:8002` / `www.<gitlab>:8002` through the
+   namespace's hosts file (so `gh` still resolves the repo from the remotes); and, if dev is
+   configured, a `kubectl proxy` that holds the dev token and
    serves read-only on `127.0.0.1:8001`. Then it starts `claude` in that namespace with no git
    token, no dev token and no bypass flag, and removes the sidecars (saving their request logs)
    when the session ends.

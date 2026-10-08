@@ -10,11 +10,20 @@ build script.
 
 Started by `tools/stack-jail.sh` as the `gitproxy` compose service (`jail-<stack>-gitproxy`) when
 the stack's env file has `GH_TOKEN` or `GITLAB_HOST`. It serves on `127.0.0.1:8002` of the jail's
-namespace. `tools/stack-jail-init.sh` then rewrites every URL shape of `github.com` and the client
-GitLab (`https://`, `http://`, `git@host:`, `ssh://git@host/`) to it with `url.<base>.insteadOf` in
-the jail's own `~/.gitconfig`. Repo configs are untouched, so the host keeps its own remotes, keys
-and helpers. Its request log is saved to `~/claude/jail/.run-<stack>/gitproxy-<time>.log` at
-session end.
+namespace, and the jail addresses it as `http://www.<host>:8002/<owner>/<repo>.git`: the launcher
+adds `www.github.com` and `www.<GITLAB_HOST>` → `127.0.0.1` to the namespace holder's `/etc/hosts`,
+which every container in the namespace shares, and the proxy picks the upstream from the Host
+header (a fixed list, nothing else is served). `tools/stack-jail-init.sh` rewrites every URL shape
+of `github.com` and the client GitLab (`https://`, `http://`, `https://www.`, `git@host:`,
+`ssh://git@host/`) to that form with `url.<base>.insteadOf` in the jail's own `~/.gitconfig`. Repo
+configs are untouched, so the host keeps its own remotes, keys and helpers.
+
+Why `www.`: `git remote -v` shows insteadOf-rewritten URLs, and `gh` resolves the repository from
+them. It treats `127.0.0.1` as an unknown host and refuses every in-repo command, but it strips a
+`www.` prefix and treats `www.github.com` as `github.com` (verified with gh 2.98; `api.github.com`
+and `*.github.com` subdomains are *not* accepted). Nothing else on a system ever talks to
+`www.github.com`, so taking that name over inside the namespace costs nothing. The request log is
+saved to `~/claude/jail/.run-<stack>/gitproxy-<time>.log` at session end.
 
 ## Policy
 
