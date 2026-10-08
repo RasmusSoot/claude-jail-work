@@ -75,17 +75,27 @@ set -a
 set +a
 
 # Bootstrap the per-stack Claude config from the login jail's solved state (onboarding, theme)
-# — once; per-stack overrides then stick. statusLine is pinned on EVERY launch: it lives in this
-# repo's project settings, which a stack jail never sees, and the script is tools/ (mounted ro).
-python3 - "$JAIL_HOME/.claude-data/settings.json" "$STATE_DIR/settings.json" <<'PY'
+# — once; per-stack overrides then stick. Pinned on EVERY launch: statusLine (it lives in this
+# repo's project settings, which a stack jail never sees; the script is tools/, mounted ro) and
+# permissions.allow. The allow list skips the permission prompt / auto-mode classifier for what it
+# matches: inside a stack jail the prompts are scenery (tokens + git are the boundaries), so the
+# default allows everything per tool. A managed deny still wins, and a managed policy may ignore
+# non-managed rules altogether. stacks/<stack>.conf may set JAIL_ALLOW (comma-separated rules,
+# since rules contain spaces; "" = none). This is the jail's own ~/.claude/settings.json, which the
+# jail could edit anyway.
+JAIL_ALLOW="${JAIL_ALLOW-Bash(*), Edit(*), Write(*), Read(*), NotebookEdit(*), WebFetch(domain:*), WebSearch}"
+JAIL_ALLOW="$JAIL_ALLOW" python3 - "$JAIL_HOME/.claude-data/settings.json" "$STATE_DIR/settings.json" <<'PY'
 import json, os, sys
 src, dst = sys.argv[1], sys.argv[2]
+allow = [r.strip() for r in os.environ.get("JAIL_ALLOW", "").split(",") if r.strip()]
 if os.path.exists(dst): s = json.load(open(dst))
 elif os.path.exists(src): s = json.load(open(src))
 else: s = {}
 s["statusLine"] = {"type": "command", "command": "/workspace/tools/statusline.sh", "padding": 1}
+s.setdefault("permissions", {})["allow"] = allow
 json.dump(s, open(dst, "w"), indent=2)
 PY
+echo "→ permissions: allow = ${JAIL_ALLOW:-<none>} (per-stack settings; managed deny rules still win)"
 TRUST_DIRS=""; for r in $REPOS; do TRUST_DIRS="$TRUST_DIRS /workspace/$r"; done
 # shellcheck disable=SC2086  # TRUST_DIRS is a space-separated list: one argv entry per dir
 python3 - "$CLAUDE_JSON" "$JAIL_HOME/.claude-data.json" $TRUST_DIRS <<'PY'

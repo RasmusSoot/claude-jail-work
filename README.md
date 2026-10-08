@@ -72,7 +72,9 @@ token. Identities, by design:
 ## What the launcher does (`tools/stack-jail.sh`)
 
 1. Reads `stacks/<stack>.conf` and `~/claude/jail/.env.<stack>`; refuses to continue without the
-   shared login file or the primary repo.
+   shared login file or the primary repo. Pins the status line and a `permissions.allow` list
+   (default: everything per tool; comma-separated `JAIL_ALLOW` in the conf overrides) into the stack's own Claude
+   settings, so the jail runs without prompts for what the managed policy does not deny.
 2. Mints the kind token (only if the namespace enforces Pod Security `baseline`/`restricted` and the
    SA can't undo that) and, if configured, the dev token (only if the SA's full permission list is
    read-only and secret-free) — each checked for JWT shape and the expected `sub` claim.

@@ -117,7 +117,7 @@ token through a single-file mount of `.credentials.json`.
 | Other stacks' repos (`READS`) mounted read-only, with no tokens or state | `tools/stack-jail.sh` | Writing to or pushing from another stack's tree |
 | Jail-only Nix stores (Nix pinned and checksummed in the image): `jail-nix` for the login jail and one `jail-nix-<stack>` volume per stack; the host `/nix` is never mounted | `Dockerfile`, `docker-compose.yml` | A jail replacing store binaries that the host's devbox or Nix profile runs (the host store is single-user and owned by the host UID), or that another stack's jail runs (a cross-client path) |
 | Separate jail git identity; host `~/.gitconfig` not mounted | `docker-compose.yml`, `setup-env.sh` | Host git config (credential helpers, includes) leaking in |
-| Permission mode is whatever the managed policy allows; the launcher passes no bypass flag (`JAIL_CLAUDE_FLAGS` exists for a granted exception) | `tools/stack-jail.sh`, `.aliases` | The jail weakening the employer policy |
+| Permission mode is whatever the managed policy allows; the launcher passes no bypass flag (`JAIL_CLAUDE_FLAGS` exists for a granted exception). It does pin a `permissions.allow` list into the stack jail's own settings (default: everything per tool, `JAIL_ALLOW` in the stack conf overrides), which skips the prompt / auto-mode classifier for those tools; a managed deny still wins, and a managed policy may ignore non-managed rules | `tools/stack-jail.sh`, `.aliases` | The jail weakening the employer policy. (The allow list is scenery by design: prompts inside a stack jail guard nothing the tokens and mounts don't; the jail could edit its own settings file anyway) |
 
 ### Git
 

@@ -7,9 +7,10 @@ start — never hand-pasted, never edited at the composition target (edit THIS f
     pair to /workspace/CLAUDE.local.md (container-local). -->
 
 You are running inside a Docker container that holds only this stack's repositories and a small
-set of scoped credentials. The permission mode is whatever the account's policy allows; do not try
-to change it, and do not build wrappers around commands the policy denies — a denied push means the
-human pushes.
+set of scoped credentials. The permission mode is whatever the account's policy allows; in a stack
+jail the launcher pins an allow list (everything per tool, by default) into the jail's own
+settings, because the real boundaries are elsewhere. Do not try to change the mode, and do not
+build wrappers around commands the policy still denies — a denied push means the human pushes.
 
 ## The boundaries (tokens + git — everything else is scenery)
 
