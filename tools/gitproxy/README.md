@@ -18,19 +18,34 @@ session end.
 
 ## Policy
 
-- Hosts: `github.com` (with `GH_TOKEN`) and `GITLAB_HOST`. Anything else is 404.
+- Hosts: `github.com` always (anonymously when there is no `GH_TOKEN`, so public clones keep
+  working on a GitLab-only stack) and `GITLAB_HOST`. Anything else is 404.
 - Endpoints: `GET <repo>/info/refs?service=…`, `POST <repo>/git-upload-pack`,
   `POST <repo>/git-receive-pack`. Nothing else is forwarded, so neither host's REST API is reachable
-  with the tokens: no `gh`, no `glab`, no issue or PR calls.
+  with the tokens: no `gh`, no `glab`, no issue or PR calls. Git LFS (`info/lfs/…`) is not forwarded
+  either; an LFS repo does not work in a jail.
 - Pushes (`git-receive-pack`, including its ref advertisement) only for repos in `GITPROXY_WRITE`:
   `FORK_ORG/<repo>` for each repo of the stack on GitHub, and `GITLAB_FORK_PATH` on GitLab. Compared
   case-insensitively, with or without `.git`.
-- Credentials: `x-access-token:$GH_TOKEN` for GitHub; on GitLab the deploy token for the fork path,
-  the read token elsewhere. A client-supplied `Authorization` header is dropped.
+- The GitHub token is sent only for repos in `GITPROXY_READ` (`UPSTREAM_OWNER/<repo>`) or
+  `GITPROXY_WRITE`; every other github.com repo is fetched anonymously. An org-wide token therefore
+  cannot read another stack's private fork from this jail. On GitLab the deploy token is used for
+  the fork path and the read token elsewhere (the launcher knows no GitLab upstream path to narrow
+  it to). A client-supplied `Authorization` header is dropped.
 - An upstream 401 is answered as 403, so git fails instead of prompting (`GIT_TERMINAL_PROMPT=0` is
-  set in the jail as well).
+  set in the jail as well). A refusal closes the connection; a truncated upstream body closes it too
+  instead of leaving git waiting.
 - One log line per request: method, host, repo, service, decision, upstream status, bytes, time.
   Never a token, never a query string beyond the service name.
+- Not rewritten in the jail, so not proxied: `ssh://host:PORT/` with a non-default SSH port and
+  `https://user@host/`. They fail or run anonymously; no token is involved either way.
+
+## Tests
+
+`devbox run test` (or `python3 -m unittest discover -s tests`): `tests/test_gitproxy.py` starts the
+proxy against a fake upstream in the test process and checks the forwarded path and credential per
+host and repo, chunked request bodies, redirect rewriting, the push and host refusals, the 401→403
+mapping, connection handling and that the log holds no token.
 
 ## Test by hand
 

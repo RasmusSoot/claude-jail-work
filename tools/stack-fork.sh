@@ -109,10 +109,10 @@ for r in $REPOS; do
   # host pushes with its own keys or helpers, and the jail rewrites every shape to its sidecar.
   want="https://github.com/$fork.git"
   if have=$(hgit "$dir" config --get remote.origin.url); then
-    case "$(lc "$have")" in
-      *"github.com/$(lc "$fork")"|*"github.com/$(lc "$fork").git"|*"github.com:$(lc "$fork")"|*"github.com:$(lc "$fork").git") ;;
-      *) echo "   ⚠ origin is $have (expected $fork on github.com) — left as is" >&2 ;;
-    esac
+    # Anchored: the host must really be github.com (not a path or a look-alike), any scheme/user/port.
+    if ! printf '%s' "$(lc "$have")" | grep -qE "^(https?://([^@/]+@)?|ssh://([^@/]+@)?|[^@/]+@)github\.com(:[0-9]+)?[:/]$(lc "$fork")(\.git)?/?$"; then
+      echo "   ⚠ origin is $have (expected $fork on github.com) — left as is" >&2
+    fi
   else
     hgit "$dir" remote add origin "$want"
     echo "   origin: $want"
