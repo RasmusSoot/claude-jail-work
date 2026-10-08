@@ -43,68 +43,87 @@ mechanism.
 
 ## Architecture
 
+Two kinds of jail. The **stack jail** is the interesting one: it holds client code, and every
+credential it can reach is either scoped to a day and harmless, or behind a sidecar.
+
+```mermaid
+graph LR
+    subgraph host["Host (work laptop)"]
+        ENV[".env.#lt;stack#gt;<br/>tokens + client facts · 600"]
+        HKUBE["host kubeconfig"]
+        WS["~/claude/jail/#lt;stack#gt;/<br/>repos + notes/"]
+        STATE["per-stack Claude state<br/>+ shared .credentials.json"]
+        LAUNCH(["tools/stack-jail.sh"])
+    end
+
+    subgraph pod["stack network namespace (one per stack)"]
+        PAUSE["pause: networks, ports,<br/>hosts: www.#lt;host#gt; = loopback"]
+        subgraph jail["stack jail: no git token, no dev token"]
+            SCL(["claude"])
+            KDEV["kdev"]
+            UP["upload :8000"]
+        end
+        GP["git proxy :8002<br/>holds the git tokens"]
+        DP["dev proxy :8001<br/>holds the dev token"]
+    end
+
+    subgraph ext["Outside"]
+        FORK(["this stack's forks"])
+        UPSTREAM(["upstream repos"])
+        GHAPI(["api.github.com"])
+        KIND(["local kind cluster"])
+        DEV(["client dev cluster"])
+    end
+
+    ENV --> LAUNCH
+    HKUBE --> LAUNCH
+    LAUNCH -- "git tokens +<br/>read/write allowlists" --> GP
+    LAUNCH -- "dev token, 8h,<br/>after the RBAC gate" --> DP
+    LAUNCH -- "kind token, 8h, after the PSA gate ·<br/>gh public-only PAT after its gate ·<br/>permissions.allow" --> jail
+    WS -- "rw, git internals ro" --> jail
+    STATE -- "rw" --> jail
+
+    SCL -- "git to www.#lt;host#gt;:8002,<br/>no credential" --> GP
+    GP -- "receive-pack: forks only" --> FORK
+    GP -- "upload-pack · token only<br/>for this stack's repos" --> UPSTREAM
+    SCL -- "gh reads · writes<br/>refused by GitHub" --> GHAPI
+    SCL -- "plain kubectl,<br/>namespace-admin" --> KIND
+    KDEV -- "no credential" --> DP
+    DP -- "GET only, no secrets/exec,<br/>RBAC read-only" --> DEV
+```
+
+The **login jail** (`jail-main`) holds no client content. It mounts this repo read-write, is the one
+session that maps the OAuth callback port, and its login is what every stack jail reuses:
+
 ```mermaid
 graph LR
     subgraph host["Host (work laptop)"]
         REPO["~/claude/claude-jail-work<br/>this repo"]
-        STATE["~/claude/jail/.claude-data*<br/>login + per-stack state"]
-        ENV[".env.#lt;stack#gt;<br/>tokens + client facts · 600"]
-        WS["~/claude/jail/#lt;stack#gt;/<br/>repos + notes/"]
-        HKUBE["host kubeconfig"]
-        LAUNCH(["tools/stack-jail.sh"])
+        LSTATE["~/claude/jail/.claude-data<br/>login state"]
         BROWSER["Browser"]
     end
 
     subgraph main["jail-main (login / mechanism)"]
         MCL(["claude"])
+        UPM["upload :8000"]
     end
 
-    subgraph pod["stack network namespace (one per stack)"]
-        subgraph stack["stack jail"]
-            SCL(["claude"])
-            KDEV["kdev (wrapper)"]
-            UP["upload server :8000<br/>token-gated"]
-        end
-        PAUSE["pause: networks + ports +<br/>hosts: www.#lt;host#gt; = loopback"]
-        DP["dev proxy sidecar<br/>holds dev token<br/>127.0.0.1:8001"]
-        GP["git proxy sidecar<br/>holds git tokens<br/>127.0.0.1:8002"]
-    end
-
-    NIX[("Nix volumes<br/>jail-nix · jail-nix-#lt;stack#gt;")]
-
-    subgraph ext["Outside"]
-        AI(["claude.ai login"])
-        FORK(["fork org on GitHub /<br/>personal fork on client GitLab"])
-        UPSTREAM(["upstream repos"])
-        KIND(["local kind cluster"])
-        DEV(["client dev cluster"])
-    end
+    AI(["claude.ai login"])
+    NIX[("Nix volumes: jail-nix,<br/>jail-nix-#lt;stack#gt; per stack jail")]
+    STACKS(["every stack jail"])
 
     REPO -- "rw" --> main
-    REPO -- "tools/ ro" --> stack
-    STATE -- "own state dir rw<br/>shared .credentials.json" --> main & stack
-    WS -- "rw (own stack, git internals ro)<br/>ro under /reads (READS)" --> stack
-    NIX --> main & stack
-
-    ENV --> LAUNCH
-    HKUBE --> LAUNCH
-    LAUNCH -- "mint 8h SA tokens after gates ·<br/>gh: public-only PAT after gate" --> stack
-    LAUNCH -- "scoped git tokens +<br/>read/write allowlists" --> GP
-
-    SCL -- "git over plain HTTP to www.#lt;host#gt;:8002,<br/>no credential (url.insteadOf)" --> GP
-    GP -- "receive-pack: this stack's forks only" --> FORK
-    GP -- "upload-pack · token only for<br/>this stack's repos" --> UPSTREAM
-    SCL -- "gh: reads at 5000/h ·<br/>writes refused by GitHub" --> UPSTREAM
-    SCL -- "namespace-admin, 8h" --> KIND
-    KDEV -- "plain HTTP on loopback,<br/>no credential" --> DP
-    DP -- "GET/HEAD only, no secrets/exec,<br/>RBAC read-only, 8h" --> DEV
-    BROWSER -- "127.0.0.1:#lt;port#gt;/?t=token" --> UP
+    LSTATE -- "rw" --> main
+    NIX --> main
     MCL -- "/login via 127.0.0.1:54545" --> AI
+    LSTATE -- ".credentials.json,<br/>single-file mount" --> STACKS
+    BROWSER -- "127.0.0.1:#lt;port#gt;/?t=token" --> UPM
 ```
 
 `jail-main` is normally the only session that maps the OAuth callback port
 (`stack-jail.sh <stack> --login` is the exception). It logs in once and every stack jail reuses the
-token through a single-file mount of `.credentials.json`.
+token through a single-file mount of `.credentials.json`. The browser reaches a stack jail's upload
+server the same way, on that stack's own loopback port.
 
 ## Measures in place
 
