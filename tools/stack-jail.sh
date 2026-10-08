@@ -119,7 +119,11 @@ jwt_sub() { # decode the JWT payload locally (base64url + padding) and print .su
 #   pod-security.kubernetes.io/enforce: baseline     # or restricted
 kind_psa_gate() {
   local kk=(kubectl --context "kind-$KIND_CLUSTER") as="system:serviceaccount:$KIND_NS:$KIND_SA" psa bad=""
-  psa=$("${kk[@]}" get ns "$KIND_NS" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null) || psa=""
+  # A failed read is not "label unset": the API may be down or the namespace missing. Say which.
+  if ! psa=$("${kk[@]}" get ns "$KIND_NS" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>"$ERR_DIR/kind-ns.err"); then
+    echo "ABORT kind: cannot read namespace $KIND_NS on kind-$KIND_CLUSTER (cluster down? namespace missing?). kubectl said:" >&2
+    sed 's/^/    /' "$ERR_DIR/kind-ns.err" | head -3 >&2; return 1
+  fi
   case "$psa" in
     baseline|restricted) ;;
     *) echo "ABORT kind: namespace $KIND_NS has pod-security.kubernetes.io/enforce='${psa:-<unset>}' — needs baseline or restricted" >&2; return 1 ;;
@@ -138,6 +142,9 @@ if [ -z "$KIND_CLUSTER" ]; then
   echo "→ kind: none declared for $STACK — plain kubectl unavailable this session"
 elif ! kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
   echo "⚠ kind cluster '$KIND_CLUSTER' not found — continuing without kind kubectl" >&2
+elif [ "$(docker container inspect -f '{{.State.Running}}' "$KIND_CLUSTER-control-plane" 2>/dev/null)" != true ]; then
+  # `kind get clusters` lists stopped clusters too; a stopped node fails every later check.
+  echo "⚠ kind cluster '$KIND_CLUSTER' exists but is not running (docker start $KIND_CLUSTER-control-plane) — continuing without kind kubectl" >&2
 elif ! kind_psa_gate; then
   echo "⚠ kind: Pod Security gate failed — kind token NOT minted (see above)" >&2
 else
