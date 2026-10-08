@@ -3,9 +3,22 @@
   "packages": [
     "kubectl@1.33.4",
     "kind@0.29.0",
-    "gh@2.98.0"
+    "gh@2.98.0",
+    "shellcheck@0.11.0",
+    "ruff@0.16.10",
+    "python@3.13"
   ],
   "shell": {
-    "init_hook": []
+    "init_hook": [],
+    "scripts": {
+      "lint": [
+        "shellcheck -x -s bash setup-env.sh tools/stack-jail.sh tools/stack-jail-init.sh tools/stack-fork.sh tools/stack-env.sh tools/host-tools.sh tools/pin-aliases.sh tools/kdev",
+        "shellcheck -s sh tools/jail-entrypoint.sh",
+        "ruff check .",
+        "ruff format --check ."
+      ],
+      "test": ["python3 -m unittest discover -s tests -v"],
+      "ci": ["devbox run lint", "devbox run test"]
+    }
   }
 }

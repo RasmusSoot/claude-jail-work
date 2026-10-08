@@ -21,3 +21,6 @@ __pycache__/
 
 # devbox profile (host tool pins; devbox.lock is committed)
 .devbox/
+
+# devbox python plugin venv (host and jail)
+.venv/

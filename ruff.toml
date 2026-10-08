@@ -1,0 +1,11 @@
+# ruff — lint + format for the stdlib-only Python in tools/ and tests/ (`devbox run lint`).
+target-version = "py313"
+line-length = 160
+extend-exclude = [".devbox", ".venv", "uploads"]
+
+[lint]
+# pycodestyle, pyflakes, isort, pyupgrade, bugbear, naming: PEP 8 and the usual mistakes.
+select = ["E", "F", "W", "I", "UP", "B", "N"]
+
+[format]
+quote-style = "double"

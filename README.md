@@ -39,6 +39,11 @@ jail-main                       # the login jail: /login once (it maps the OAuth
 
 Fill in `~/claude/jail/.claude-data.gitconfig` (the jail's git identity) while you are at it.
 
+Checks, on the host or in `jail-main`: `devbox run ci` runs shellcheck over every script,
+`ruff check` + `ruff format --check` over the Python, and the end-to-end tests in `tests/`
+(each server started against a fake peer and driven through real requests). `devbox run lint` and
+`devbox run test` are the halves. The tools are pinned in `devbox.json` next to the host tools.
+
 Per stack (`siva` as the example):
 
 ```bash

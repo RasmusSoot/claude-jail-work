@@ -9,6 +9,7 @@ reachable by every container on the jail's Docker networks (kind pods, other jai
 page in the host browser, so without it anyone could drop files where Claude reads them. The custom
 header also forces a CORS preflight, which this server never answers — cross-origin posts fail.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -159,6 +160,7 @@ def make_handler(target_dir: Path, token: str, max_bytes: int):
 
         def do_GET(self):  # noqa: N802
             from urllib.parse import parse_qs, urlsplit
+
             url = urlsplit(self.path)
             if url.path in ("/", "/index.html"):
                 if not token_ok(parse_qs(url.query).get("t", [""])[0]):
@@ -183,6 +185,7 @@ def make_handler(target_dir: Path, token: str, max_bytes: int):
             raw_name = self.headers.get("X-Filename", "")
             try:
                 from urllib.parse import unquote
+
                 raw_name = unquote(raw_name)
             except Exception:
                 pass
