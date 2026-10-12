@@ -23,10 +23,11 @@ RUN apt-get update && \
 # user. Login shell bash (also what the Bash tool runs).
 # macOS hosts have GID 20 (staff), which Debian already uses (dialout): reuse an existing group.
 RUN (getent group ${HOST_GID} >/dev/null || groupadd -g ${HOST_GID} claude) && \
-    useradd -u ${HOST_UID} -g ${HOST_GID} -m -s /bin/bash claude
+    useradd -l -u ${HOST_UID} -g ${HOST_GID} -m -s /bin/bash claude
 ENV LANG=C.UTF-8 SHELL=/bin/bash
 
 # Devbox (Jetify): the binary is baked in; packages come from the jails' OWN Nix store below.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN curl -fsSL https://get.jetify.com/devbox | bash -s -- -f && \
     chmod 0755 /usr/local/bin/devbox
 
@@ -48,6 +49,9 @@ COPY tools/jail-entrypoint.sh /usr/local/bin/jail-entrypoint.sh
 RUN chmod +x /usr/local/bin/jail-entrypoint.sh
 
 USER claude
+# Mount point for the per-stack Maven cache volume (docker-compose.yml): it must exist in the
+# image, owned by claude, or Docker creates it root-owned when it initialises the volume.
+RUN mkdir -p /home/claude/.m2
 RUN curl -fsSL -o /tmp/nix-install "https://releases.nixos.org/nix/nix-${NIX_VERSION}/install" && \
     echo "${NIX_INSTALL_SHA256}  /tmp/nix-install" | sha256sum -c - && \
     sh /tmp/nix-install --no-daemon --no-channel-add --no-modify-profile --yes && \

@@ -36,6 +36,11 @@ GITLAB_READ_TOKEN=
 GITLAB_FORK_PATH=            # e.g. group/you/iac-fork  (the path the deploy token is scoped to)
 GITLAB_DEPLOY_USER=
 GITLAB_DEPLOY_TOKEN=
+# Kind registry push credential (build sidecar only): the user/password the stack's registry (Zot,
+#   anonymous pull) wants for pushes. Leave empty: tools/kind-stack.sh <stack> up generates both and
+#   writes them here. Held by the build sidecar, never by the jail; worth only this stack's names.
+REGISTRY_PUSH_USER=
+REGISTRY_PUSH_PASSWORD=
 # Client dev cluster (optional): HOST kubeconfig context + the read-only SA to mint from.
 DEV_KUBE_CONTEXT=
 DEV_KUBE_NS=

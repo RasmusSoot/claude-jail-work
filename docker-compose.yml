@@ -61,6 +61,7 @@ services:
       - ./tools:/workspace/tools:ro
       - ${JAIL_HOME}/.claude-data.gitconfig:/home/claude/.gitconfig-base:ro
       - jail-nix-stack:/nix               # one store PER STACK: a jail must not tamper with another client's tools
+      - jail-m2-stack:/home/claude/.m2    # per-stack Maven cache: a full build per session is too slow; same trust as the Nix store
     network_mode: "container:${JAIL_NETNS:-launch-via-tools-stack-jail-sh}"
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -95,4 +96,7 @@ volumes:
   jail-nix:
   jail-nix-stack:
     name: jail-nix-${STACK_NAME:-unset}
+  # Per-stack Maven local repository (`docker volume rm jail-m2-<stack>` resets it).
+  jail-m2-stack:
+    name: jail-m2-${STACK_NAME:-unset}
 

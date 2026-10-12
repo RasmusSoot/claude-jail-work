@@ -11,7 +11,8 @@
 #   3. make `upstream` fetch-only (push URL no_push://disabled);
 #   4. add `origin` = the fork if missing, and fetch it.
 # Idempotent: re-run after adding a repo to REPOS. Existing branches and their tracking are left
-# alone. No rulesets or branch protection are set on the forks.
+# alone. A REPOS entry that is a plain directory without .git (a local-only stack home) is passed
+# over. No rulesets or branch protection are set on the forks.
 #
 # Runs on the HOST with your own `gh` login (the jail's token cannot create repositories), and it is
 # the only place remotes can change: inside a stack jail each repo's .git/config is read-only.
@@ -66,6 +67,9 @@ failed=""
 for r in $REPOS; do
   up="$UPSTREAM_OWNER/$r"; fork="$FORK_ORG/$r"; dir="$JAIL_HOME/$STACK/$r"
   echo "── $r"
+  # A plain directory (no .git) is a local-only entry — a stack home holding CLAUDE.md, lab files —
+  # not a clone to fork or wire. Leave it alone.
+  if [ -d "$dir" ] && [ ! -e "$dir/.git" ]; then echo "   local-only dir, no .git — not a fork, left alone"; continue; fi
 
   # 1. fork
   if parent=$(gh api "repos/$fork" --jq 'if .fork then .parent.full_name else "" end' 2>/dev/null); then
@@ -88,7 +92,7 @@ for r in $REPOS; do
     git -c core.hooksPath=/dev/null clone -q --origin upstream "https://github.com/$up.git" "$dir" \
       || { echo "   ✗ clone failed" >&2; failed="$failed $r"; continue; }
   elif [ ! -d "$dir/.git" ]; then
-    echo "   ✗ $dir exists but has no .git directory — skipping" >&2; failed="$failed $r"; continue
+    echo "   ✗ $dir/.git is not a directory (worktree/submodule?) — skipping" >&2; failed="$failed $r"; continue
   fi
   cd_ok=$(cat "$dir/.git/commondir" 2>/dev/null || echo .)
   [ "$cd_ok" = "." ] || { echo "   ✗ $dir/.git/commondir points to '$cd_ok' — inspect before touching it" >&2; failed="$failed $r"; continue; }

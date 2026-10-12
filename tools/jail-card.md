@@ -10,7 +10,9 @@ You are running inside a Docker container that holds only this stack's repositor
 set of scoped credentials. The permission mode is whatever the account's policy allows; in a stack
 jail the launcher pins an allow list (everything per tool, by default) into the jail's own
 settings, because the real boundaries are elsewhere. Do not try to change the mode, and do not
-build wrappers around commands the policy still denies — a denied push means the human pushes.
+route around commands the policy still denies — not through a wrapper script, `bash -c`, a path,
+or `devbox run` (rule matching is text, and runners are not stripped, so a denied verb would slip
+through; that is exactly why it is on you not to). A denied push means the human pushes.
 
 ## The boundaries (tokens + git — everything else is scenery)
 
@@ -34,6 +36,13 @@ build wrappers around commands the policy still denies — a denied push means t
   token (no credential is in this jail): anything but GET, and any secrets, exec, attach,
   port-forward or proxy request, gets 403. `kdev auth can-i` does not work (it is a POST). Never set
   `KUBECONFIG` by hand, never `use-context`, never merge the two files. Every `kdev` call prints its cluster banner — read it.
+- **argocd**: when the stack has Argo CD on its kind cluster, the session card carries an 8h token
+  for an account that can `get`, `sync` and read `logs` on this stack's Applications and nothing
+  else — no app, repo, project or account writes; the API answers those with permission denied,
+  which is the policy, not a bug. Applications track the chart in the stack registry (any version),
+  so the loop is: change the chart, `build-image --chart`, `argocd app sync`. Self-heal is on: a
+  `kubectl` edit in the namespace is reverted; put it in the chart. `helm install/upgrade` stay
+  denied and are not needed.
 - **No client fact in any repo**: CIDRs, hostnames, ServiceAccount names, the GitLab URL — these
   live in the human's gitignored env file. Charts and configs you write come from public sources
   or from the client's own repo, never retyped into a third place.
@@ -51,6 +60,10 @@ build wrappers around commands the policy still denies — a denied push means t
 - Memory and session history persist at `/home/claude/.claude` (bind-mounted per stack).
 - A stack may declare `READS`: other stacks' repo dirs mounted read-only under `/reads/<stack>/<repo>`.
   They are views, not workspaces — no tokens for them, no commits in them.
+- **No docker, no image push from here.** When the stack has a build sidecar, `build-image` (in
+  `tools/`) explodes a jar into `/workspace/build/<id>/` and the sidecar runs the Paketo lifecycle
+  on it and pushes image and chart to the stack's kind registry, names from an allowlist only. The
+  session card says whether it is there. Do not look for another way to push.
 - Published ports are loopback-only on the host. The upload server (inbox: `notes/uploads/` in a
   stack jail) needs the per-session token printed at launch — never echo or log that URL.
 
