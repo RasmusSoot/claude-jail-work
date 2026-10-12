@@ -123,12 +123,15 @@ def credential(host: str, repo: str) -> tuple[str, str] | None:
 
 
 def log(*fields: object) -> None:
-    print(time.strftime("%Y-%m-%dT%H:%M:%S"), *fields, flush=True)
+    # Fields can carry client input (the service name of a refused request): a newline in one
+    # would forge a log line, so anything outside printable ASCII becomes "?".
+    print(time.strftime("%Y-%m-%dT%H:%M:%S"), *(re.sub(r"[^\x20-\x7e]", "?", str(f)) for f in fields), flush=True)
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "gitproxy"
+    timeout = 600  # same as the upstream side: a stalled client holds a thread for this long, not forever
     sys_version = ""
 
     def log_message(self, *_: object) -> None:  # the default logs the full request line; ours is explicit

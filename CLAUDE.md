@@ -14,12 +14,19 @@ Derived from the home variant (`upstream`, fetch-only); cherry-pick in either di
 - `stacks/<name>.conf`: what a stack jail mounts — generic by rule (repo dir names, primary dir,
   kind cluster, a host port). Client FACTS never go here; they live in `~/claude/jail/.env.<name>`.
 - Host-side scripts: `tools/stack-env.sh` (env file template), `tools/stack-fork.sh` (fork, clone,
-  remotes), `tools/pin-aliases.sh` (`jail-pin`). Those that call `kubectl`/`kind`/`gh` take them
-  from this repo's `devbox.json` via `tools/host-tools.sh`. `.aliases`: host launch shortcuts,
-  loopback-only ports.
-- In-jail: `tools/kdev` (the dev cluster wrapper), `tools/statusline.sh`, `tools/upload/` (the
-  file-drop server).
+  remotes), `tools/kind-stack.sh` (a stack's kind cluster, registry with push policy, Argo CD),
+  `tools/pin-aliases.sh` (`jail-pin`). Those that call `kubectl`/`kind`/`gh` take them from this
+  repo's `devbox.json` via `tools/host-tools.sh`. `.aliases`: host launch shortcuts, loopback-only
+  ports. `tools/review_md.py` generates `REVIEW.md`.
+- In-jail: `tools/kdev` (the dev cluster wrapper), `tools/build-image` (hands a jar to the build
+  sidecar), `tools/statusline.sh`, `tools/upload/` (the file-drop server).
+- Sidecars the launcher starts next to a stack jail: `tools/gitproxy/` (git credentials),
+  `tools/builder/` (the Paketo build + push), a `kubectl proxy` for the dev cluster.
 - `docs/security.md`: the security model — what is a boundary, what is scenery, what is accepted.
+  Every measure row carries a Review sentence: the rule a reviewer holds a diff to. `REVIEW.md`
+  is generated from those by `tools/review_md.py` (lint runs it, so the doc's structure is checked;
+  the file is gitignored and never edited by hand). Reviewing a change here means reading that
+  column, or the generated file.
 
 ## Hard rules
 

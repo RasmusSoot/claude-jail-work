@@ -13,6 +13,7 @@ header also forces a CORS preflight, which this server never answers — cross-o
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hmac
 import html
@@ -74,7 +75,9 @@ function fmtSize(b) {{
 
 async function upload(blob, name) {{
   const li = document.createElement('li');
-  li.innerHTML = `<span class="name">${{name}}</span><span class="size">…</span>`;
+  const nameEl = document.createElement('span'); nameEl.className = 'name'; nameEl.textContent = name;  // a file named like markup must not become markup
+  const sizeEl = document.createElement('span'); sizeEl.className = 'size'; sizeEl.textContent = '…';
+  li.append(nameEl, sizeEl);
   log.prepend(li);
   try {{
     const r = await fetch('/upload', {{
@@ -128,7 +131,9 @@ document.addEventListener('paste', e => {{
 def safe_name(name: str) -> str:
     name = name.strip().replace("\\", "/").split("/")[-1]
     name = re.sub(r"[^\w.\- ]+", "_", name)
-    return name or "upload.bin"
+    if not name.strip("."):  # "." would resolve to the inbox itself and unique_path would then name a sibling of it
+        return "upload.bin"
+    return name
 
 
 def unique_path(target: Path) -> Path:
@@ -147,8 +152,11 @@ def make_handler(target_dir: Path, token: str, max_bytes: int):
         return hmac.compare_digest(given.encode(), token.encode())
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = 60  # a peer that connects and stalls holds a thread for this long, not forever
+
         def log_message(self, fmt, *args):
-            sys.stderr.write(f"{self.address_string()} - {fmt % args}\n")
+            line = re.sub(r"\?[^ \"]*", "", fmt % args)  # the request line carries ?t=<token>: never log the query
+            sys.stderr.write(f"{self.address_string()} - {line}\n")
 
         def _json(self, status: int, body: dict) -> None:
             data = json.dumps(body).encode()
@@ -183,12 +191,10 @@ def make_handler(target_dir: Path, token: str, max_bytes: int):
                 self._json(403, {"ok": False, "error": "bad token"})
                 return
             raw_name = self.headers.get("X-Filename", "")
-            try:
+            with contextlib.suppress(Exception):  # a malformed percent-escape keeps the raw name
                 from urllib.parse import unquote
 
                 raw_name = unquote(raw_name)
-            except Exception:
-                pass
             name = safe_name(raw_name) if raw_name else f"upload-{dt.datetime.now():%Y%m%d-%H%M%S}.bin"
             target = unique_path(target_dir / name)
             length = int(self.headers.get("Content-Length", "0"))
@@ -219,7 +225,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dir", required=True, type=Path, help="Target directory for uploads")
     ap.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
-    ap.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
+    ap.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")  # noqa: S104  # inside the jail's network namespace: the published port and the kind network must reach it; the token is the guard
     ap.add_argument("--max-mib", type=int, default=256, help="Per-upload size cap (default: 256)")
     args = ap.parse_args()
     token = os.environ.get("UPLOAD_TOKEN", "")

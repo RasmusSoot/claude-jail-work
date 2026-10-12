@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import http.client
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -126,6 +127,9 @@ class GitProxyTest(unittest.TestCase):
         assert READ_TOKEN not in log and DEPLOY_TOKEN not in log, "token leaked into the proxy log"
         assert "service=" not in log, "query string leaked into the proxy log"
         assert "git-receive-pack" in log and "push refused" in log
+        # A refused service name is logged, so a newline in it must not start a forged line.
+        assert "?FORGED" in log, "the refused service name was not logged (sanitised)"
+        assert not re.search(r"^FORGED", log, re.M), "a client-supplied newline forged a log line"
 
     def setUp(self):
         Upstream.seen.clear()
@@ -146,6 +150,10 @@ class GitProxyTest(unittest.TestCase):
         return Upstream.seen[i]["headers"].get("Authorization", "")
 
     # ── transformation ───────────────────────────────────────────────────────────────────────
+    def test_unknown_service_is_refused_and_cannot_forge_a_log_line(self):
+        resp, _ = self.request("GET", "/group/upstream.git/info/refs?service=%0AFORGED%20audit%20line")
+        self.assertEqual(resp.status, 403)
+
     def test_fetch_is_forwarded_with_the_read_token(self):
         resp, data = self.request("GET", "/group/upstream.git/info/refs?service=git-upload-pack")
         self.assertEqual(resp.status, 200)

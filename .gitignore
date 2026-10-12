@@ -11,6 +11,10 @@
 # composed session card (written at container start)
 /CLAUDE.local.md
 
+# generated from docs/security.md by tools/review_md.py (lint regenerates it); commit it only
+# when a PR review service has to read it from the tree — the --check mode exists for that day
+/REVIEW.md
+
 # login jail inbox: uploads AND the private design notes (DESIGN.md) — must stay ignored
 /uploads/
 

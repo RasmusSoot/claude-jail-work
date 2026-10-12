@@ -40,11 +40,12 @@ class UploadTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="upload-test-")
         cls.inbox = Path(cls.tmp.name) / "inbox"
         cls.port = free_port()
+        cls.errlog = open(Path(cls.tmp.name) / "server.log", "w")  # the server's stderr: checked for leaks at teardown
         cls.proc = subprocess.Popen(
             [sys.executable, "-I", str(UPLOAD), "--dir", str(cls.inbox), "--port", str(cls.port), "--host", "127.0.0.1", "--max-mib", "1"],
             env={"PATH": os.environ["PATH"], "UPLOAD_TOKEN": TOKEN},
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=cls.errlog,
         )
         wait_port(cls.port)
 
@@ -52,7 +53,12 @@ class UploadTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.proc.terminate()
         cls.proc.wait(5)
+        cls.errlog.close()
+        log = (Path(cls.tmp.name) / "server.log").read_text()
         cls.tmp.cleanup()
+        # The request line of GET /?t=<token> is logged: the query must be stripped from it.
+        assert "GET /" in log, "nothing logged"
+        assert TOKEN not in log and "?t=" not in log, "the upload token leaked into the server log"
 
     def request(self, method: str, path: str, body=None, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -85,6 +91,16 @@ class UploadTest(unittest.TestCase):
         self.assertEqual(j["name"], "pa sswd")
         self.assertEqual(Path(j["path"]).parent, self.inbox.resolve())
         self.assertFalse((self.inbox.parent / "etc").exists())
+
+    def test_dot_only_names_stay_inside_the_inbox(self):
+        # "." resolves to the inbox itself; the uniqueness fallback would then have named a sibling of it
+        before = {p.name for p in self.inbox.parent.iterdir()}
+        for name in (".", "..", "..."):
+            status, body = self.upload(name, b"dots")
+            self.assertEqual(status, 200, name)
+            self.assertEqual(Path(body["path"]).parent, self.inbox, name)
+            self.assertTrue(Path(body["path"]).is_file(), name)
+        self.assertEqual({p.name for p in self.inbox.parent.iterdir()}, before)
 
     def test_name_collisions_do_not_overwrite(self):
         self.upload("same.bin", b"first")

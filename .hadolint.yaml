@@ -1,0 +1,6 @@
+# hadolint (devbox run lint) over Dockerfile and tools/builder/Dockerfile.
+ignored:
+  # DL3008 "pin apt versions": Debian package versions are pinned by the base tag, not per package;
+  # exact versions vanish from the mirrors within weeks and the build would break for nothing.
+  # The image's inputs are "latest at build time, rebuild to update" by decision (docs/security.md).
+  - DL3008
