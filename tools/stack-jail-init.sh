@@ -41,6 +41,7 @@ fi
 
 # ── kubectl: two FILES, never two contexts in one ───────────────────────────────────────────────
 mkdir -p "$HOME/.kube"
+_sj_umask=$(umask); umask 077                           # every file below is born 600: no window before the chmod
 _sj_kubeconfig() { # <file> <context> <server> <ca> <token> <ns> <user>
   cat > "$1" <<EOT
 apiVersion: v1
@@ -74,7 +75,20 @@ EOT
 else
   _sj_dev="no dev credential this session — \`kdev\` is unavailable."
 fi
-export PATH="/workspace/tools:$PATH"                   # kdev
+if [ -n "${STACK_ARGO_TOKEN:-}" ]; then
+  # The argocd CLI reads these three; the token is the stack's own Argo account, get+sync only, 8h.
+  export ARGOCD_SERVER="$STACK_ARGO_SERVER" ARGOCD_AUTH_TOKEN="$STACK_ARGO_TOKEN" ARGOCD_OPTS="--insecure"
+  _sj_argo="\`argocd app get|sync|wait|logs|diff <app>\` on this stack's Applications (project \`${STACK_NAME:-stack}\`, server \`$STACK_ARGO_SERVER\`, 8h token in \`ARGOCD_AUTH_TOKEN\`; \`argocd\` itself comes from the repo's devbox). The account can get and sync, nothing else: creating, editing or deleting an Application, a repo or an account is refused by the API. Applications pull the chart version the sidecar pushed; auto-sync + self-heal is on, so a hand edit in the namespace is reverted — change the chart and push instead."
+else
+  _sj_argo="no Argo CD token this session — \`argocd\` is unavailable (the stack has no ARGO_APPS, or the launcher's gate refused)."
+fi
+if [ -n "${STACK_BUILD_DIR:-}" ]; then
+  _sj_build="\`build-image <app.jar> --name <name> [--tag T] [--chart chart.tgz] [--env BP_X=y]\` hands the jar (and chart) to a build sidecar that runs the Paketo lifecycle and pushes to \`${STACK_BUILD_REGISTRY}\` — names allowed: ${STACK_BUILD_NAMES}. Nothing in this jail pushes; the sidecar holds the registry credential. Requests and logs: \`${STACK_BUILD_DIR}/<id>/\`."
+else
+  _sj_build="no build sidecar this session — images cannot be built or pushed from here."
+fi
+umask "$_sj_umask"; unset _sj_umask
+export PATH="/workspace/tools:$PATH"                   # kdev, build-image
 
 # ── session card ────────────────────────────────────────────────────────────────────────────────
 {
@@ -88,6 +102,8 @@ export PATH="/workspace/tools:$PATH"                   # kdev
 - **gh**: ${_sj_gh}
 - **kubectl (kind)**: ${_sj_kind}
 - **kdev (client dev)**: ${_sj_dev}
+- **build-image**: ${_sj_build}
+- **argocd**: ${_sj_argo}
 - **notes**: \`/workspace/notes\` — the human's and agents' shared, persistent notes for this stack. Never committed to any repo or published; client facts are fine here. A local git repo with no remote: the launcher snapshots it before and after each session, so whatever you write is reviewed. Read it at the start of non-trivial work; write things meant to outlast this session.
 - **uploads**: files dropped via the upload UI land in \`${UPLOAD_DIR:-/workspace/notes/uploads}\` (gitignored inbox, outside every repo).
 
@@ -96,7 +112,7 @@ EOT
   if [ -f /workspace/tools/jail-card.md ]; then cat /workspace/tools/jail-card.md; else _sj_warn "tools/jail-card.md missing"; echo "(ground-rules card missing)"; fi
 } > /workspace/CLAUDE.local.md 2>/dev/null || _sj_warn "could not write /workspace/CLAUDE.local.md"
 
-unset _sj_kind _sj_dev _sj_git _sj_gh                 # GH_TOKEN stays: it is gh's, public-read-only, gated by the launcher
-unset STACK_KUBE_TOKEN STACK_KUBE_CA
+unset _sj_kind _sj_dev _sj_git _sj_gh _sj_build _sj_argo        # GH_TOKEN stays: it is gh's, public-read-only, gated by the launcher
+unset STACK_KUBE_TOKEN STACK_KUBE_CA STACK_ARGO_TOKEN            # ARGOCD_AUTH_TOKEN stays: it is argocd's, get+sync only, gated by the launcher
 unset -f _sj_warn _sj_kubeconfig _sj_route 2>/dev/null
 true
