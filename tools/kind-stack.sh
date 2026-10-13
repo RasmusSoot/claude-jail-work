@@ -11,7 +11,7 @@
 #   kind-stack.sh <stack> argo-policy       print the Argo CD RBAC policy `up` renders (the launcher's
 #                                   gate requires the cluster's to equal it, line for line)
 #   kind-stack.sh <stack> down      delete the cluster; the registry stays (it is the layer cache)
-#   kind-stack.sh <stack> purge     down + remove the registry container and its volume
+#   kind-stack.sh <stack> purge     down + remove the registry container and its storage dir
 #
 # Why here and not in a stack's lab repo: the host runs this with the host's Docker and kubeconfig,
 # and a stack jail can write every file in its lab repo. The rule is "the host runs nothing from a
@@ -33,8 +33,8 @@
 #   BUILD_NAMES       the names the build sidecar may push (tools/stack-jail.sh); here they are also
 #                     the registry's push policy: the push user may write exactly <name>, <name>-cache
 #                     and charts/<name> for each, nothing else. Re-run `up` after changing them.
-# The registry is per stack: container `jail-<stack>-registry` (Zot, REGISTRY_IMAGE), volume
-# `jail-registry-<stack>`, reachable as jail-<stack>-registry:5000 on the kind network — which is
+# The registry is per stack: container `jail-<stack>-registry` (Zot, REGISTRY_IMAGE), reachable
+# as jail-<stack>-registry:5000 on the kind network — which is
 # what the launcher's BUILD_REGISTRY defaults to; it runs as the host user with no capability, its
 # storage in ~/claude/jail/.registry-<stack>-data/. Anyone may pull; pushes need the credential
 # REGISTRY_PUSH_USER/PASSWORD from ~/claude/jail/.env.<stack>, which `up` generates and writes there
@@ -241,7 +241,8 @@ EOT
 
 # containerd on every node: the registry by its kind-network name (what the charts reference and
 # the sidecar pushes to) and, if published, as localhost:<port> (what the kind docs assume). Plain
-# HTTP; the certs.d config dir is containerd's default in current kindest/node images.
+# HTTP, through hosts.toml files under certs.d, which containerd reads only where config_path says
+# so (set at create time above; added here on nodes made before that).
 registry_wire() {
   local n host
   for n in $(nodes); do
@@ -249,7 +250,16 @@ registry_wire() {
     # (pods keep running; the kubelet reconnects). Without it the hosts.toml below is never read
     # and the node speaks HTTPS to the plain-HTTP registry.
     if ! docker exec "$n" grep -q 'config_path' /etc/containerd/config.toml; then
-      printf '\n[plugins."io.containerd.grpc.v1.cri".registry]\n  config_path = "/etc/containerd/certs.d"\n' | docker exec -i "$n" sh -c 'cat >> /etc/containerd/config.toml'
+      # Under the registry table if the file has one (a second header for the same table is a TOML
+      # error and containerd would not come back), else appended with its header.
+      docker exec -i "$n" sh -s <<'EOS'
+f=/etc/containerd/config.toml; t='[plugins."io.containerd.grpc.v1.cri".registry]'
+if grep -qxF "$t" "$f"; then
+  awk -v t="$t" '{ print } $0 == t { print "  config_path = \"/etc/containerd/certs.d\"" }' "$f" > "$f.new" && cat "$f.new" > "$f" && rm -f "$f.new"
+else
+  printf '\n%s\n  config_path = "/etc/containerd/certs.d"\n' "$t" >> "$f"
+fi
+EOS
       docker exec "$n" systemctl restart containerd
       ok "registry: $n's containerd now reads /etc/containerd/certs.d (setting added, containerd restarted)"
     fi
@@ -292,9 +302,10 @@ EOT
 
 # What the launcher's kind gate checks before minting (tools/stack-jail.sh kind_psa_gate): the
 # namespace enforces Pod Security baseline, and the SA, bound to the built-in `admin` ClusterRole
-# by a namespaced RoleBinding, cannot patch/delete any namespace, create namespaces, reach the
-# kubelet, or hold more than get/list/watch (and no shell subresource) in any namespace but this
-# one. Nothing more: everything else the stack deploys is the lab's, inside this namespace.
+# by a namespaced RoleBinding, cannot patch/delete any namespace, create namespaces or reach the
+# kubelet, holds nothing beyond get/list/watch where there is no Pod Security label, and no shell
+# subresource in any labelled namespace but this one. Nothing more: everything else the stack
+# deploys is the lab's, inside this namespace.
 stack_rbac() {
   kc apply -f - >/dev/null <<EOT
 apiVersion: v1

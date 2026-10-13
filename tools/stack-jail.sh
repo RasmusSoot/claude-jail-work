@@ -227,8 +227,8 @@ jwt_sub() { # decode the JWT payload locally (base64url + padding) and print .su
 # hostPID pod is root on the node and, through it, likely on the host. So before minting, the
 # namespace must enforce Pod Security baseline or restricted (both forbid those pods), and the SA
 # must not be able to take that away: no patch/update/delete of any namespace, no creating
-# namespaces (a fresh one would have no label), no kubelet reach, and nothing beyond read-only
-# (no shell subresource either) in any namespace but its own. The label, the SA
+# namespaces (a fresh one would have no label), no kubelet reach, nothing beyond read-only where
+# there is no label, and no shell subresource in any labelled namespace but its own. The label, the SA
 # and its RoleBinding are applied by tools/kind-stack.sh <stack> up (host-side, from the conf):
 #   pod-security.kubernetes.io/enforce: baseline     # or restricted
 rules_not_readonly() { # stdin: `kubectl auth can-i --list` output → every row allowing more than get/list/watch, or any secrets read
