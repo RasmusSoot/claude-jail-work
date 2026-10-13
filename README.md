@@ -1,163 +1,158 @@
-# Claude Code — Docker Jail
+# claude-jail-work — Docker jails for Claude Code, one per stack
 
-Runs Claude Code in an isolated Docker container with full permissions, persistent memory, and host file access. Files written inside the container are owned by your host user.
+The work variant of [claude-jail](https://github.com/teststuffstash/claude-jail): Claude Code in a
+container that holds only one stack's repositories (one client's project, e.g. SiVa) and a few
+scoped, short-lived credentials, under whatever permission mode the account's managed policy
+allows.
 
-## Architecture
+**Design rule:** tokens + git are the boundaries. A jail's credentials cannot write to an upstream
+repository or mutate a client cluster, so the container needs no command filter to be safe.
+The generic security model — boundaries vs scenery, every measure and where it lives, accepted
+risks, open items — is [docs/security.md](docs/security.md) for the stack jail and
+[docs/security-jail-main.md](docs/security-jail-main.md) for the login jail. Client-specific notes
+stay outside this repo.
 
-```mermaid
-graph LR
-    subgraph host["Host Machine"]
-        H1["~/Projects/"]
-        H2["~/Projects/.claude-data/"]
-        H3["~/Projects/.claude-data.json"]
-        H4["~/Projects/.claude-data.zsh_history"]
-        H5["~/.zshrc · ~/.oh-my-zsh/"]
-        H6[".env: HOST_UID · HOST_GID · GH_TOKEN"]
-        BROWSER["Browser"]
-    end
+## Layout on the host
 
-    subgraph jail["Docker Jail — node:22-bookworm"]
-        J1["/workspace"]
-        J2["/home/node/.claude/"]
-        J3["/home/node/.claude.json"]
-        J4["/home/node/.zsh_history"]
-        J5["shell config"]
-        TINI(["tini · PID 1"])
-        CLAUDE(["claude CLI"])
-        UP["upload server :8000"]
-        CB["OAuth listener :54545"]
-    end
-
-    subgraph ext["External"]
-        AI(["claude.ai — Pro / Max"])
-        GH(["GitHub — teststuffstash"])
-    end
-
-    H1 -- "rw" --> J1
-    H2 -- "rw" --> J2
-    H3 -- "rw" --> J3
-    H4 -- "rw" --> J4
-    H5 -- "ro" --> J5
-    H6 -. "env vars" .-> CLAUDE
-    TINI -- "spawns" --> CLAUDE
-    TINI -- "spawns (bg)" --> UP
-    BROWSER -- "drag / paste files" --> UP
-    CLAUDE -- "1. /login opens" --> BROWSER
-    BROWSER -- "2. authenticate" --> AI
-    AI -- "3. redirect to localhost:54545" --> BROWSER
-    BROWSER -- "4. callback" --> CB
-    CB -- "5. token" --> CLAUDE
-    CLAUDE -- "fine-grained PAT" --> GH
 ```
-
-Claude runs as a non-root user with your host UID/GID — files created in `/workspace` appear on the host owned by you, no `chown` needed. The `node` user has passwordless sudo so packages can be installed mid-session (`sudo apt-get install ...`); such installs live only in the container's writable layer and are lost on rebuild, so add anything you want to keep to the `Dockerfile`. Note that since `node` is remapped to host UID/GID, sudo→root inside the container has host-root reach over the mounted `~/Projects`.
+~/claude/claude-jail-work/          this repo (the mechanism)
+~/claude/jail/<stack>/<repo>/       per-stack workspaces — each repo: `upstream` fetch-only, `origin` = your fork
+~/claude/jail/<stack>/notes/        shared notes + upload inbox: local git, no remote, never published
+~/claude/jail/.env.<stack>          tokens + client FACTS (outside any repo, mode 600; tools/stack-env.sh)
+~/claude/jail/.claude-data*         Claude state: shared login + per-stack memory/history
+~/claude/jail/.run-<stack>/         sidecar request logs (git proxy, dev proxy), one each per session
+```
 
 ## Bootstrap
 
-### 1. Build
+Host prerequisites: Docker with the compose plugin, devbox, and `gh` logged in (for
+`stack-fork.sh`). The host-side scripts take `kubectl`, `kind` and `gh` from this repo's
+`devbox.json` (exact pins, via `tools/host-tools.sh`), not from whatever the host has installed.
+The same file pins the host's interactive tools for these stacks, `k9s` and the `argocd` CLI (the
+3.4 line is what nixpkgs has; it tolerates the 3.5 server with a warning), so the whole team runs
+one version set and nothing is installed globally: `devbox shell` here, or
+`devbox run -- k9s --context kind-siva`. Never a stack repo's devbox on the host: that file is
+jail-written, and its init_hook would run as you.
+
+Once per machine:
 
 ```bash
-./setup-env.sh
+./setup-env.sh                  # .env (UID/GID, JAIL_HOME), state files, jail gitconfig template
 docker compose build
+tools/pin-aliases.sh            # review + pin .aliases, then add the ~/.zshrc snippet from the
+                                # script header and open a new shell
+jail-main                       # the login jail: /login once (it maps the OAuth port on loopback)
 ```
 
-`setup-env.sh` writes your UID/GID to `.env` and generates `docker-compose.override.yml` with whichever zsh dotfiles exist on your host. Re-run it if your dotfiles change.
+Fill in `~/claude/jail/.claude-data.gitconfig` (the jail's git identity) while you are at it.
 
-### 2. Run
+Checks, on the host or in `jail-main`: `devbox run ci` (`devbox run lint` and `devbox run test`
+are its halves; the tools are pinned in `devbox.json` next to the host tools). It runs:
 
-Use the `main` alias from `.aliases` (it publishes the upload + OAuth ports):
+- shellcheck over every script, and hadolint over both Dockerfiles (`.hadolint.yaml` lists the one
+  ignored rule and why);
+- gitleaks over the whole git history and the working tree — the "nothing client-derived, no
+  credential in git" rule as a check (`.gitleaks.toml` holds the few allowed paths);
+- `tools/review_md.py`, which generates the gitignored `REVIEW.md` from the security model's
+  Review column and so checks that every measure row has one;
+- `ruff check` (including bandit's rule set, `S`) and `ruff format --check` over the Python;
+- the end-to-end tests in `tests/`: each server started against a fake peer and driven through
+  real requests, the build sidecar's loop against a fake lifecycle and helm, and `kind-stack.sh`'s
+  registry policy rendering.
+
+Per stack (`siva` as the example):
 
 ```bash
-main   # = docker compose run --rm -p 8000:8000 -p 54545:54545 claude
+tools/stack-env.sh siva         # creates ~/claude/jail/.env.siva (mode 600) — fill it in
+tools/stack-fork.sh siva        # fork into FORK_ORG, clone from UPSTREAM_OWNER, wire remotes, record the gitdirs
+tools/kind-stack.sh siva up     # the stack's kind cluster + registry + namespace/SA the launcher mints for
+siva                            # the stack jail (alias for tools/stack-jail.sh siva)
+devbox install                  # inside the jail, once: each stack has its own Nix store
 ```
 
-For project sessions use the other `.aliases` shortcuts (`car-fleet`, `homelab`, `life`) — see [Upload server & ports](#upload-server--ports). Compose itself declares no `ports:`; each alias publishes its own with `-p`.
+A stack needs a `stacks/<name>.conf` (see `stacks/siva.conf`) and an alias line in `.aliases`
+(then `jail-pin`).
 
-### 3. Log in
+`stack-fork.sh` is idempotent: re-run it after adding a repo to `REPOS`, since remotes cannot be
+changed inside a jail. It also records each clone it makes in `~/claude/jail/.run-<stack>/gitdirs`
+(path and inode). The launcher trusts only recorded gitdirs and stops on any other `.git` it
+finds, printing the exact `tools/stack-jail.sh <stack> --adopt <dir>/.git …` to run once you have
+looked at it (one you made on the host with `git init`, or one a session planted). Submodules,
+`.git` pointer files and symlinked gitdirs are refused outright.
 
-From the **main** jail (it's the only session that maps the OAuth callback port `54545`), run:
+`kind-stack.sh` is the whole host side of a stack's kind cluster, all from the conf, so every
+stack gets the same shape:
 
-```
-/login
-```
+- the per-stack registry (Zot: anyone pulls; one generated credential pushes, and only the names
+  in `BUILD_NAMES`; its web UI is on the loopback port);
+- the cluster (node image pinned by `KIND_NODE_IMAGE`) and containerd's registry config on its
+  nodes;
+- the namespace with `pod-security.kubernetes.io/enforce: baseline`, which the launcher requires
+  before minting, plus the workbench ServiceAccount and its RoleBinding;
+- when the conf lists `ARGO_APPS`, Argo CD: the pinned upstream release, a repository entry for
+  the stack registry's charts (OCI, plain HTTP), an AppProject confined to the stack namespace,
+  one auto-syncing Application per chart name, the jail's get+sync account, and a read Role so
+  `kubectl -n argocd get app` works from the jail.
 
-This authenticates via your claude.ai account (Pro or Max). The token is persisted in `~/Projects/.claude-data/` and reused by every other session — you only log in once.
+`kind-stack.sh <stack> ui` forwards the Argo CD UI to host loopback (a port-forward, so it works
+on Linux, Mac and Windows alike) and prints the admin login. **The host runs nothing from a
+stack's tree**: a lab repo is jail-written, so cluster lifecycle and anything else you execute on
+the host belongs in `tools/`.
 
-### 4. GitHub CLI (optional)
+## Identities
 
-GitHub doesn't support pre-selecting fine-grained token permissions via URL, so you'll need to configure these manually.
+By design:
 
-**First, enable fine-grained PATs in your org:**
-`https://github.com/organizations/teststuffstash/settings/personal-access-tokens`
-→ Allow access via fine-grained personal access tokens
-
-**Then create the token:**
-[Open token creation →](https://github.com/settings/personal-access-tokens/new?description=claude-jail&resource_owner=teststuffstash)
-
-Configure it as follows:
-
-| Field | Value |
-|---|---|
-| Resource owner | `teststuffstash` |
-| Repository access | All repositories |
-| Administration | Read and Write |
-| Contents | Read and Write |
-| Issues | Read and Write |
-| Metadata | Read (auto) |
-| Pull requests | Read and Write |
-| Workflows | Read and Write |
-| Everything else | No access |
-
-Then add it to `.env`:
-
-```bash
-GH_TOKEN=github_pat_...
-```
-
-Repo deletions are recoverable — org owners can restore deleted repos via GitHub settings for 90 days.
-
-## What's inside
-
-| Path (container) | Path (host) | Notes |
+| Purpose | Credential | Reach |
 |---|---|---|
-| `/workspace` | `~/Projects` | Read-write. Your working directory. |
-| `/home/node/.claude/` | `~/Projects/.claude-data/` | Memory, history, settings. |
-| `/home/node/.claude.json` | `~/Projects/.claude-data.json` | Onboarding state (theme, startup count). |
-| `/home/node/.zsh_history` | `~/Projects/.claude-data.zsh_history` | Shell history. |
-| `/home/node/.gitconfig` | `~/Projects/.claude-data.gitconfig` | Jail-only git identity; host `~/.gitconfig` is intentionally not mounted. |
-| `/home/node/.zshrc` | `~/.zshrc` | Read-only. |
-| `/home/node/.oh-my-zsh/` | `~/.oh-my-zsh/` | Read-write (plugin installs persist). |
+| GitHub forks | fine-grained PAT, resource owner = your trust-domain org, Contents R/W + Metadata only (git needs nothing else, the sidecar exposes nothing else); held by the git proxy sidecar, never by the jail | pushes to this stack's forks only (the sidecar's allowlist), fetches anywhere on github.com |
+| GitHub API (`gh`), optional | fine-grained PAT, resource owner = you, public repositories only, no permissions; the one token that enters the jail, gated at launch (fine-grained, valid, sees no private repo). Only for stacks whose upstreams and forks are all public | authenticated rate limit for `gh` reads; every write refused by GitHub |
+| Client GitLab, read | personal token, `read_repository`; held by the sidecar | fetch upstream |
+| Client GitLab, write | deploy token, `write_repository`, on YOUR fork inside the client's GitLab, protected `main`; held by the sidecar | that fork's unprotected branches |
+| Local kind | namespace-admin ServiceAccount, minted per launch, 8 h | one namespace, plain `kubectl` |
+| Argo CD on kind, optional (`ARGO_APPS` in the conf) | token for a local Argo account whose whole policy is get, sync and logs on the stack's project; minted per launch, 8 h, after the API confirms as that token that it cannot write Applications, repos, the project or other accounts; the account is disabled between sessions and every token on it deleted at launch and at session end; the admin login that does this verifies Argo's TLS certificate | `argocd app get/sync/wait/logs` on this stack's Applications |
+| Kind registry push | user/password for the stack's registry (Zot, anonymous pull); generated by `kind-stack.sh` into `.env.<stack>` when absent; held by the build sidecar (`tools/builder/`), never by the jail | the sidecar's own pushes: image, cache and chart under `BUILD_NAMES`, which the registry's policy enforces too |
+| Client dev cluster | read-only ServiceAccount, minted per launch after impersonation proves it cannot mutate or read secrets, 8 h; held by a proxy sidecar, never by the jail | GET through the proxy (`kdev`) |
 
-## Upload server & ports
+## What the launcher does (`tools/stack-jail.sh`)
 
-`tini` runs as PID 1 and auto-starts the file-drop upload server (`tools/upload/upload.py`) in the background before launching `claude` — see `tools/jail-entrypoint.sh`. It lets you paste/drag screenshots and docs from the host into the jail. Dropped files land in each project's gitignored `uploads/` inbox; move them out of `uploads/` to commit. Details in `tools/upload/README.md`.
+1. Reads `stacks/<stack>.conf` and `~/claude/jail/.env.<stack>`; refuses to continue without the
+   shared login file or the primary repo. Pins the status line and a `permissions.allow` list
+   (default: everything per tool; comma-separated `JAIL_ALLOW` in the conf overrides) into the
+   stack's own Claude
+   settings, so the jail runs without prompts for what the managed policy does not deny.
+2. Mints the kind token (only if the namespace enforces Pod Security `baseline`/`restricted` and the
+   SA can't undo that), the Argo CD token if the stack has Argo CD (only if the API, asked as that
+   token, denies every write and allows sync; deleted again at exit) and, if configured, the dev
+   token (only if the SA's full permission list is read-only and secret-free) — each checked for
+   JWT shape and the expected `sub` claim.
+3. Mounts only the stack's repo dirs, its `notes/` and the per-stack Claude state, with each
+   recorded gitdir's `config`, `hooks` and `commondir` read-only. Snapshots `notes/` (local git)
+   and audits the repos for planted nested repositories and unrecorded gitdirs before the session
+   and again after it.
+4. Starts the jail's network namespace like a Kubernetes pod: a pause container on a per-stack
+   bridge (plus the kind network) that publishes the upload UI on a loopback port, and in that
+   namespace the sidecars:
+   - the git proxy (`tools/gitproxy/`), which holds the GitHub and GitLab tokens, forwards git
+     smart-HTTP only and accepts pushes only for this stack's forks, on `127.0.0.1:8002`, reached
+     as `www.github.com:8002` / `www.<gitlab>:8002` through the namespace's hosts file (so `gh`
+     still resolves the repo from the remotes);
+   - if dev is configured, a `kubectl proxy` that holds the dev token and serves read-only on
+     `127.0.0.1:8001`;
+   - if the conf names a `BUILDER_IMAGE`, the build sidecar (`tools/builder/`: that Paketo
+     builder plus helm, image `jail-<stack>-builder`), which runs the CNB lifecycle on requests
+     from the shared `~/claude/jail/<stack>/build` dir and pushes image and chart to the kind
+     registry, `BUILD_NAMES` only, holding the registry credential the jail never gets (jail
+     side: `tools/build-image`).
 
-To run several sessions at once without port clashes, the **container** always serves the upload UI on `8000` while each alias publishes its own **host** port with `-p` (compose declares no `ports:`):
+   Then it starts `claude` in that namespace with no git token, no dev token and no bypass flag,
+   and removes the sidecars (saving their request logs) when the session ends.
+   `tools/stack-jail-init.sh` routes git to the sidecar (`url.insteadOf`, no credential store),
+   writes `~/.kube/kind.yaml` and a credential-less `~/.kube/dev.yaml`, and renders the session
+   card.
 
-| Session | Upload UI (host) | OAuth (host) |
-|---|---|---|
-| `main` (`~/Projects`) | `localhost:8000` | `54545` ← log in here |
-| car-fleet | `localhost:8001` | — |
-| homelab | `localhost:8002` | — |
-| life | `localhost:8003` | — |
+## Not in this variant
 
-The **main** jail runs from `~/Projects` for general/infra work and is the only session that maps the OAuth port, so it's the only one that can complete `/login` (the callback is fixed to `localhost:54545`). The project jails don't publish it at all. Log in once via `main`; the token persists in `.claude-data/` and works in every other session.
-
-## Cross-jail handoff
-
-During big platform rollouts a stack session (e.g. oracle) often needs quick homelab-side work
-from the mono session without GitHub-issue latency or copy-pasting between terminals. A shared
-file-drop channel covers this: the stack jail writes task files to `/workspace/.handoff/inbox/`
-(host `~/Projects/.handoff/<stack>/`, mounted per stack by `tools/stack-jail.sh`), and the mono
-session processes them with `/handoff` — typically looped, `/loop /handoff`. Results come back in
-`done/`. Protocol, file format, and boundaries: [`tools/handoff.md`](tools/handoff.md). It's a
-speed channel for attended sessions, not a tracker — durable outcomes still land in issues/docs.
-
-## Re-running
-
-```bash
-main        # general/infra jail (also where you /login)
-car-fleet   # or homelab / life
-```
-
-No rebuild needed unless you update the `Dockerfile`. Re-run `setup-env.sh` if your zsh dotfiles change.
+Passwordless sudo, the Docker socket, host kubeconfig or SSH keys, cross-jail handoff channels,
+and any OpenRouter / OpenCode routing. The image is built on the host (`docker compose build`);
+pushes are the human's.

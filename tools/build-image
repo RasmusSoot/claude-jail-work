@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# build-image — jail side of the build sidecar: hand an application jar (and optionally a packaged
+# chart) to the Paketo lifecycle running in the sidecar, wait, print what was pushed.
+#
+#   build-image <app.jar> --name <image name> [--tag <tag>] [--chart <chart.tgz>] [--env BP_X=y]…
+#
+# Nothing here pushes: the jar is exploded into the shared build directory as a request, and the
+# sidecar (tools/builder/builder.sh) builds it in the real builder image and pushes the image and
+# the chart to the stack's kind registry under its name allowlist, with a credential this jail
+# does not have. Buildpack inputs: every BP_*/BPL_* variable in this environment, plus --env.
+# The tag defaults to the jar's repo HEAD (short sha); a dirty tree gets "-dirty-<HHMMSS>" so two
+# builds of uncommitted work never share a tag (the lifecycle reuses layers from the image already
+# under the tag, and a node that has the tag will not re-pull it); no repo: a timestamp.
+# Exit status is the build's. BUILD_TIMEOUT (seconds, default 1200) bounds the wait.
+set -euo pipefail
+
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+die() { echo "build-image: $*" >&2; exit 1; }
+
+BUILD_DIR="${STACK_BUILD_DIR:-}"
+[ -n "$BUILD_DIR" ] && [ -d "$BUILD_DIR" ] || die "no build sidecar this session — stacks/<stack>.conf needs BUILDER_IMAGE and BUILD_NAMES (see the session card)"
+
+jar="" name="" tag="" chart="" envs=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name)  name="${2:-}"; shift 2 ;;
+    --tag)   tag="${2:-}"; shift 2 ;;
+    --chart) chart="${2:-}"; shift 2 ;;
+    --env)   envs+=("${2:-}"); shift 2 ;;
+    -h|--help) usage ;;
+    -*) die "unknown option $1" ;;
+    *) [ -z "$jar" ] || die "one jar only"; jar="$1"; shift ;;
+  esac
+done
+[ -n "$jar" ] && [ -n "$name" ] || usage
+[ -f "$jar" ] || die "$jar is not a file"
+case " ${STACK_BUILD_NAMES:-} " in *" $name "*) ;; *) die "'$name' is not in this stack's BUILD_NAMES (${STACK_BUILD_NAMES:-<none>}) — the sidecar would refuse it" ;; esac
+[ -z "$chart" ] || [ -f "$chart" ] || die "$chart is not a file"
+for e in ${envs[@]+"${envs[@]}"}; do
+  printf '%s' "$e" | grep -qE '^(BP|BPL)_[A-Z0-9_]+=' || die "--env takes BP_KEY=value or BPL_KEY=value, got '$e'"
+done
+
+if [ -z "$tag" ]; then
+  if git -C "$(dirname "$jar")" rev-parse --short=12 HEAD >/dev/null 2>&1; then
+    tag=$(git -C "$(dirname "$jar")" rev-parse --short=12 HEAD)
+    [ -z "$(git -C "$(dirname "$jar")" status --porcelain 2>/dev/null)" ] || tag="$tag-dirty-$(date -u +%H%M%S)"
+  else
+    tag=$(date -u +%Y%m%dT%H%M%SZ)
+  fi
+fi
+printf '%s' "$tag" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$' || die "tag '$tag' is not a valid image tag"
+
+id="$name-$tag-$(date -u +%Y%m%dT%H%M%S)"
+req="$BUILD_DIR/$id"
+mkdir -p "$req/app"
+# Explode the jar: the Paketo Spring Boot buildpack detects the exploded layout (BOOT-INF/, META-INF/).
+python3 -I - "$jar" "$req/app" <<'PY'
+import os, sys, zipfile
+src, dst = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(src) as z:
+    for m in z.infolist():
+        p = os.path.normpath(m.filename)
+        if p.startswith("..") or os.path.isabs(p):
+            raise SystemExit(f"refusing archive path {m.filename!r}")
+        z.extract(m, dst)
+PY
+[ -z "$chart" ] || cp "$chart" "$req/chart.tgz"
+chart_name=""
+if [ -n "$chart" ]; then
+  # The chart's own name (Chart.yaml inside the tgz); the sidecar checks it against BUILD_NAMES.
+  chart_name=$(tar -xzOf "$chart" --wildcards '*/Chart.yaml' 2>/dev/null | sed -n 's/^name: *//p' | head -1) || true
+  [ -n "$chart_name" ] || die "could not read the chart name from $chart"
+fi
+{
+  echo "IMAGE=$name:$tag"
+  [ -z "$chart_name" ] || echo "CHART=$chart_name"
+  env | grep -E '^(BP|BPL)_[A-Z0-9_]+=' || true
+  for e in ${envs[@]+"${envs[@]}"}; do echo "$e"; done
+} > "$req/request.env"
+: > "$req/log"
+: > "$req/request"                                              # the marker: complete, build it
+echo "build-image: request $id → $name:$tag${chart_name:+ + chart $chart_name} (log: $req/log)" >&2
+
+tail -n +1 -f "$req/log" >&2 & tp=$!
+deadline=$(( $(date +%s) + ${BUILD_TIMEOUT:-1200} ))
+while [ ! -f "$req/result.env" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || { kill "$tp" 2>/dev/null; die "timed out after ${BUILD_TIMEOUT:-1200}s — is the sidecar running? (its log is saved on the host at session end)"; }
+  sleep 1
+done
+sleep 0.5; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null || true
+get() { sed -n "s/^$1=//p" "$req/result.env" | head -1; }
+status=$(get STATUS)
+echo "image: $(get IMAGE)${status:+ }$( [ -n "$(get IMAGE_DIGEST)" ] && echo "@$(get IMAGE_DIGEST)")"
+[ -z "$(get CHART)" ] || echo "chart: oci://${STACK_BUILD_REGISTRY:-?}/charts/$(get CHART)$( [ -n "$(get CHART_DIGEST)" ] && echo " @$(get CHART_DIGEST)")"
+[ "$status" = ok ] || die "build $status — see $req/log"

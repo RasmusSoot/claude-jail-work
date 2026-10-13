@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# kdev — the CLIENT DEV cluster, read-only. Plain `kubectl` is the local kind cluster.
+# Layers: the SA's RBAC, the launcher's permission check before minting, and the proxy sidecar
+# that holds the token (GET/HEAD only, no secrets, no exec) — this wrapper is convenience on top.
+# Secrets are refused here too (read-only is not harmless: a dumped secret would land in the LLM
+# context and in telemetry).
+set -euo pipefail
+cfg="$HOME/.kube/dev.yaml"
+[ -f "$cfg" ] || { echo "kdev: no dev access this session (see the session card)" >&2; exit 2; }
+case "${1:-}" in
+  get|describe|logs|top|events|explain|api-resources|version|cluster-info) ;;   # no `auth`: can-i/whoami are POSTs, which the proxy refuses
+  *) echo "kdev: '${1:-}' is not a read verb. dev is read-only; kind is plain kubectl." >&2; exit 2 ;;
+esac
+for a in "$@"; do case "$a" in secret|secrets|secret/*|secrets/*) echo "kdev: secrets are off-limits on dev" >&2; exit 2;; esac; done
+# kubectl comes from the repo's devbox, not the image: PATH first (inside `devbox shell`), then the
+# devbox profile of the nearest devbox.json above $PWD, then each mounted stack repo. The profile
+# binary is used directly so no init_hook runs (it could change KUBECONFIG under us).
+find_kubectl() {
+  command -v kubectl && return
+  local d="$PWD"
+  while [ "$d" != / ]; do
+    [ -f "$d/devbox.json" ] && [ -x "$d/.devbox/nix/profile/default/bin/kubectl" ] && { echo "$d/.devbox/nix/profile/default/bin/kubectl"; return; }
+    d="$(dirname "$d")"
+  done
+  for r in ${STACK_REPOS:-}; do
+    [ -x "/workspace/$r/.devbox/nix/profile/default/bin/kubectl" ] && { echo "/workspace/$r/.devbox/nix/profile/default/bin/kubectl"; return; }
+  done
+  return 1
+}
+kubectl_bin=$(find_kubectl) || { echo "kdev: no kubectl — add it to the repo's devbox.json and run \`devbox install\`" >&2; exit 2; }
+echo "▶ cluster: client-dev (read-only)" >&2
+exec env KUBECONFIG="$cfg" "$kubectl_bin" --context client-dev "$@"

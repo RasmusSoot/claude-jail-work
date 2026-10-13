@@ -1,61 +1,83 @@
 # Jail card — container ground rules for every jail session
 
-<!-- The ONE versioned home for jail-session ground rules (claude-jail#1, homelab FU-117).
-Composed into the session at container start — never hand-pasted, never edited at the
-composition target (edit THIS file):
-  - mono jail: tools/jail-entrypoint.sh writes it to /workspace/CLAUDE.local.md, and
-    additionally composes homelab's agents/jail-seat-card.md to
-    /workspace/homelab/CLAUDE.local.md (homelab-scoped, seat sessions only);
-  - stack jail: tools/stack-jail-init.sh prepends its rendered per-stack env card and
-    writes the pair to /workspace/CLAUDE.local.md (container-local). Stack jails get NO
-    homelab seat card by design — see the seat card's header for why. -->
+<!-- The ONE versioned home for jail-session ground rules. Composed into the session at container
+start — never hand-pasted, never edited at the composition target (edit THIS file):
+  - login jail: tools/jail-entrypoint.sh writes it to /workspace/CLAUDE.local.md;
+  - stack jail: tools/stack-jail-init.sh prepends its rendered per-stack card and writes the
+    pair to /workspace/CLAUDE.local.md (container-local). -->
 
-You are running inside a Docker container with full permissions. All actions are
-pre-approved — do not ask for confirmation before running commands, editing files, or
-installing packages.
+You are running inside a Docker container that holds only this stack's repositories and a small
+set of scoped credentials. The permission mode is whatever the account's policy allows; in a stack
+jail the launcher pins an allow list (everything per tool, by default) into the jail's own
+settings, because the real boundaries are elsewhere. Do not try to change the mode, and do not
+route around commands the policy still denies — not through a wrapper script, `bash -c`, a path,
+or `devbox run`. Rule matching is on the command text and runners are not stripped, so a denied
+verb would slip through; that is exactly why it is on you not to. A denied push means the human
+pushes.
+
+## The boundaries (tokens + git — everything else is scenery)
+
+- **git**: `upstream` remotes are fetch-only. `origin` is the human's fork and the only place a
+  push can land. Code reaches upstream only through a merge or pull request the human opens
+  under their own name. Add a `Co-Authored-By` trailer to commits you author. In stack jails each
+  mounted repo's `.git/config`, `.git/hooks` and `.git/commondir` are read-only, so `push -u`,
+  `remote add` and `branch --set-upstream-to` fail by design — push without `-u`. Do not
+  `git init` or clone inside `/workspace` (a lab dir included) and do not add submodules: the host
+  trusts only the gitdirs it recorded, and any other one stops the next launch until the human has
+  inspected it.
+  There is no git token in a stack jail: a credential sidecar on loopback adds it, forwards git
+  smart-HTTP only (no GitHub/GitLab API), and refuses pushes to anything but the stack's forks.
+  Remotes show as `http://www.<host>:<port>/<owner>/<repo>.git` in `git remote -v`: that name is
+  the sidecar (it resolves to loopback here), not a typo and not a different repo. A 403 from it is
+  the policy, not a bug; do not look for another route.
+- **gh**: a read tool here, and it works in a repo directory without `-R`. The only token it may
+  have is public-read-only (it buys the rate limit, nothing else), so `gh pr list`, `gh pr view`,
+  `gh run view`, `gh api` reads work and every write is refused by GitHub. Without that token `gh`
+  refuses to run at all. Pull requests, comments, issues and releases are the human's, from the
+  host. The session card says which of the two states this session is in.
+- **kubectl**: plain `kubectl` is the LOCAL KIND cluster (namespace-admin, disposable — destructive
+  verbs are fine there). `kdev` is the CLIENT DEV cluster, read-only through a proxy that holds the
+  token (no credential is in this jail): anything but GET, and any secrets, exec, attach,
+  port-forward or proxy request, gets 403. `kdev auth can-i` does not work (it is a POST). Never set
+  `KUBECONFIG` by hand, never `use-context`, never merge the two files. Every `kdev` call prints its
+  cluster banner — read it.
+- **argocd**: when the stack has Argo CD on its kind cluster, the session card carries an 8h token
+  for an account that can `get`, `sync` and read `logs` on this stack's Applications and nothing
+  else — no app, repo, project or account writes; the API answers those with permission denied,
+  which is the policy, not a bug. Applications track the chart in the stack registry (any version),
+  so the loop is: change the chart, `build-image --chart`, `argocd app sync`. Self-heal is on: a
+  `kubectl` edit in the namespace is reverted; put it in the chart. `helm install/upgrade` stay
+  denied and are not needed.
+- **No client fact in any repo**: CIDRs, hostnames, ServiceAccount names, the GitLab URL — these
+  live in the human's gitignored env file. Charts and configs you write come from public sources
+  or from the client's own repo, never retyped into a third place.
+- **Secrets**: if a command output contains a token, key or personal data, say so generically and
+  do not echo it. `kdev` cannot read secrets on purpose; do not look for another way.
 
 ## Environment
 
-- Container base: `node:22-bookworm` (Debian, running as `node` user remapped to host
-  UID/GID)
-- The `node` user has **passwordless sudo** — install packages directly with
-  `sudo apt-get install ...` (installs are ephemeral; add to claude-jail's `Dockerfile`
-  to persist them)
-- **Project tooling is Devbox/Nix, not apt.** For per-project CLI tools (tofu, kubectl,
-  talosctl, helm, …) prefer a committed `devbox.json` + `devbox shell` over ephemeral
-  `sudo apt`/`curl` installs. The `/nix` store is bind-mounted from the host, so the same
-  `devbox.json` works in the jail and on the host (and persists across rebuilds).
-  `devbox.lock` is committed for deterministic versions.
-- Memory and session history: persisted at `/home/node/.claude`, bind-mounted to the host
-  (`.claude-data/` for the mono jail, `.claude-data-<stack>/` per stack jail)
-- Two jail classes share this card. The **mono jail** mounts all of the host's
-  `~/Projects` at `/workspace` (read-write). A **stack jail** mounts only its stack's
-  repos plus `tools/`, and shallow-clones homelab inside the container — its session card
-  (prepended above this one) carries the per-stack facts: credentials, kubectl, ports.
-
-## Homelab platform services (S3, DB, dashboards, …)
-
-Many projects here build on the self-hosted **homelab** Kubernetes cluster. To discover
-what services exist (and which are only planned), **read
-[`/workspace/homelab/SERVICES.md`](/workspace/homelab/SERVICES.md) and grep it** — that
-catalog is the source of truth. **Do not `kubectl` around the cluster to discover
-services**, and do not assume a service exists until the catalog marks it `LIVE` (e.g.
-S3/Garage and Postgres/CloudNativePG are both LIVE). Statuses change — **recheck the
-catalog, never repeat a remembered status** (Postgres sat in this very sentence as
-"PLANNED" long after it went LIVE). How to consume one is linked from the catalog.
+- Container base: `debian:trixie` with only the jail's own needs (git, python3, jq, curl, procps);
+  runs as `claude` with the host UID/GID; no sudo. No node, kubectl or gh in the image — use the
+  repo's devbox (`devbox run …`).
+- **Project tooling is Devbox/Nix, not apt.** `/nix` is a jail-only store (one Docker volume per
+  stack, never the host's), so `devbox install` / `devbox run` work here directly; the same
+  committed `devbox.json` works on the host against the host's own store.
+- Memory and session history persist at `/home/claude/.claude` (bind-mounted per stack).
+- A stack may declare `READS`: other stacks' repo dirs mounted read-only under
+  `/reads/<stack>/<repo>`.
+  They are views, not workspaces — no tokens for them, no commits in them.
+- **No docker, no image push from here.** When the stack has a build sidecar, `build-image` (in
+  `tools/`) explodes a jar into `/workspace/build/<id>/` and the sidecar runs the Paketo lifecycle
+  on it and pushes image and chart to the stack's kind registry, names from an allowlist only. The
+  session card says whether it is there. Do not look for another way to push.
+- Published ports are loopback-only on the host. The upload server (inbox: `notes/uploads/` in a
+  stack jail) needs the per-session token printed at launch — never echo or log that URL.
 
 ## Behavior
 
-- Run commands without asking for permission first.
-- Prefer fixing things directly over explaining how to fix them.
-- Be concise. Skip trailing summaries.
-- **Prior-art check before creating anything named** (a doc, script, tracker entry, ADR,
-  manifest): these projects are heavily documented — assume the concern already has an
-  owner. Grep the project's docs/trackers/memory by topic keywords and state what you
-  found ("nothing matches <keywords>") before writing. If a related artifact exists,
-  extend it, never create a parallel one.
-- **Resolve references before acting on them.** When the user names a thing ("the
-  credential helper", "that follow-up", "the leaked PAT"), it exists — grep for it and
-  act on what you find, not on a reconstruction. Questions like "is this already tracked
-  somewhere?" are retrieval requests (the user half-remembers, without the exact
-  place/id), not decisions delegated to you.
+- Prefer fixing things directly over explaining how to fix them. Be concise.
+- **Prior-art check before creating anything named** (a doc, script, chart, manifest): grep the
+  repo first and say what you found before writing. Extend what exists; never create a parallel one.
+- **Resolve references before acting on them.** When the human names a thing, it exists — find it.
+- **Two clusters means every claim names its cluster.** "Works" is not a finding; "works on kind,
+  dev shows X" is.

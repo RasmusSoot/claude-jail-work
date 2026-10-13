@@ -1,26 +1,48 @@
-# claude-jail — Docker jails for Claude Code sessions
+# claude-jail-work — per-stack Claude Code jails under an employer-managed policy
 
 Repo facts only. **Session ground rules do not live here** — they live in
-[`tools/jail-card.md`](tools/jail-card.md), composed into `CLAUDE.local.md` at container
-start (claude-jail#1, homelab FU-117): the mono jail's `tools/jail-entrypoint.sh` writes
-the card to `/workspace/CLAUDE.local.md` and homelab's `agents/jail-seat-card.md` to
-`/workspace/homelab/CLAUDE.local.md` (seat sessions only); a stack jail's
-`tools/stack-jail-init.sh` prepends its rendered per-stack env card instead and gets no
-seat card by design.
+[`tools/jail-card.md`](tools/jail-card.md), composed into `CLAUDE.local.md` at container start.
+Derived from the home variant (`upstream`, fetch-only); cherry-pick in either direction
+deliberately.
 
 ## What this repo is
 
-- `Dockerfile` + `docker-compose.yml`: one image, two services — `claude` (the **mono
-  jail**: all of the host's `~/Projects` mounted at `/workspace`) and `stack` (the
-  **per-stack jails**: scoped mounts, per-stack tokens, SA-scoped kubectl; launcher
-  `tools/stack-jail.sh`, in-container init `tools/stack-jail-init.sh`).
-- `.aliases`: host-side launch shortcuts, one per session type. Each publishes its own
-  upload port; only `main` maps the OAuth callback port 54545, so log in there once —
-  every other session shares the token via the `.credentials.json` single-file mount.
-- `tools/`: the entrypoint, the stack launcher/init pair, the upload server, the
-  cross-jail handoff protocol (`tools/handoff.md`), and the jail card.
-- This directory doubles as the host's `~/Projects`: project repos are cloned
-  side-by-side and gitignored here (see `.gitignore`'s cloned-projects block).
-- Credential boundary (HARD RULE): no credential in any jail may reach beyond the
-  `teststuffstash` org — fine-grained PATs with that resource owner, or App installation
-  tokens.
+- `Dockerfile` + `docker-compose.yml`: one image, two services — `claude` (the **login/mechanism
+  jail**: only this repo mounted; the one session that maps the OAuth port) and `stack` (the
+  **per-stack jail**: scoped repo mounts + `notes/`, per-stack tokens, a kind kubeconfig and a
+  credential-less dev kubeconfig served by a proxy sidecar; launcher `tools/stack-jail.sh`,
+  in-container init `tools/stack-jail-init.sh`).
+- `stacks/<name>.conf`: what a stack jail mounts — generic by rule (repo dir names, primary dir,
+  kind cluster, a host port). Client FACTS never go here; they live in `~/claude/jail/.env.<name>`.
+- Host-side scripts: `tools/stack-env.sh` (env file template), `tools/stack-fork.sh` (fork, clone,
+  remotes, the gitdir record), `tools/kind-stack.sh` (a stack's kind cluster, registry with push
+  policy, Argo CD),
+  `tools/pin-aliases.sh` (`jail-pin`). Those that call `kubectl`/`kind`/`gh` take them from this
+  repo's `devbox.json` via `tools/host-tools.sh`. `.aliases`: host launch shortcuts, loopback-only
+  ports. `tools/review_md.py` generates `REVIEW.md`.
+- In-jail: `tools/kdev` (the dev cluster wrapper), `tools/build-image` (hands a jar to the build
+  sidecar), `tools/statusline.sh`, `tools/upload/` (the file-drop server).
+- Sidecars the launcher starts next to a stack jail: `tools/gitproxy/` (git credentials),
+  `tools/builder/` (the Paketo build + push), a `kubectl proxy` for the dev cluster.
+- `docs/security.md`: the security model of the **stack jail** — what is a boundary, what is
+  scenery, what is accepted. `docs/security-jail-main.md`: the same for the login jail, which sees
+  no client content (short; a developer on a stack never opens that jail).
+  Every measure row in both carries a Review sentence: the rule a reviewer holds a diff to.
+  `REVIEW.md`
+  is generated from those by `tools/review_md.py` (lint runs it, so the doc's structure is checked;
+  the file is gitignored and never edited by hand). Reviewing a change here means reading that
+  column, or the generated file.
+
+## Hard rules
+
+- **Tokens + git are the boundaries; everything else is scenery.** No credential in a jail may be
+  able to write to an upstream repo or mutate a client cluster. The launcher is the only place
+  credentials are injected; everything that enters a jail itself is scoped and lives a day at most
+  (kind, Argo) or is harmless (the public-only `gh` token), and the long-lived ones (git, registry)
+  go to sidecars, where policy, not secrecy, bounds what they can do.
+- **Nothing client-derived in this repo** — no copied files, no retyped files, no facts (CIDRs,
+  hostnames, SA names, GitLab URLs). Those live in the gitignored per-stack env file.
+- **Pushes are human** under the managed policy (`! git push` from the prompt, or from the host).
+  The launcher passes no permission-bypass flag; `JAIL_CLAUDE_FLAGS` exists for a granted exception.
+- **No OpenRouter / OpenCode / third-party model routing** in this variant — it is not permitted at
+  work. Anthropic via the account login only.

@@ -1,49 +1,30 @@
-# secrets
+# secrets / host-specific
 .env
 .env.*
 
-# machine-specific claude state
+# claude state is never under this repo (it lives in ~/claude/jail), but just in case
 .claude-data/
 .claude-data.*
 .claude-data-*
 .claude/settings.local.json
 
-# IDE
-.idea/
-
-# cloned projects (add subdirectory names here)
-life/
-homelab/
-car-fleet/
-idp/
-sleep-tracking/
-snore-recorder/
-oracle-fleet/
-oracle-iac/
-sleep-iac/
-agent-coordinator/
-agent-runtime/
-teststuff/
-bookmarks/
-nordic-testing-days-2024-talk/
-presentations/
-allure-behavior-snippets/
-openrouter-operator/
-circles/
-circles-iac/
-hardware/
-
-# composed session card (written by tools/jail-entrypoint.sh at container start;
-# the homelab checkout gitignores its own copy) — claude-jail#1
+# composed session card (written at container start)
 /CLAUDE.local.md
 
-# upload server inbox (main jail) — move files out to commit them
+# generated from docs/security*.md by tools/review_md.py (lint regenerates it); commit it only
+# when a PR review service has to read it from the tree — the --check mode exists for that day
+/REVIEW.md
+
+# login jail inbox: uploads AND the private design notes (DESIGN.md) — must stay ignored
 /uploads/
 
-# cross-jail handoff channel (runtime task files — see tools/handoff.md)
-.handoff/
-
-# python bytecode (e.g. from the upload tool)
+# IDE / python
+.idea/
 __pycache__/
 *.pyc
 
+# devbox profile (host tool pins; devbox.lock is committed)
+.devbox/
+
+# devbox python plugin venv (host and jail)
+.venv/

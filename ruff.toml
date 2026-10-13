@@ -1,0 +1,16 @@
+# ruff — lint + format for the stdlib-only Python in tools/ and tests/ (`devbox run lint`).
+target-version = "py313"
+line-length = 160
+extend-exclude = [".devbox", ".venv", "uploads"]
+
+[lint]
+# pycodestyle, pyflakes, isort, pyupgrade, bugbear, naming: PEP 8 and the usual mistakes.
+# S = flake8-bandit: bandit's checks (subprocess, eval, hardcoded secrets, 0.0.0.0, try/pass …).
+select = ["E", "F", "W", "I", "UP", "B", "N", "S"]
+
+[lint.per-file-ignores]
+# Tests drive real processes with fake credentials on purpose: assert, subprocess, literal tokens.
+"tests/*" = ["S101", "S603", "S607", "S105", "S106", "S104"]
+
+[format]
+quote-style = "double"

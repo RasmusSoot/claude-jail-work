@@ -1,0 +1,14 @@
+# gitleaks (devbox run lint): the "nothing client-derived, no credential in this repo" rule as a
+# check, over the git history and the working tree. Default rules; only paths are allowed through:
+# the `dir` scan does not honour .gitignore, and these are never committed.
+title = "claude-jail-work"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "gitignored: compiled Python, the login jail's private inbox and design notes"
+paths = [
+  '''__pycache__/''',
+  '''^uploads/''',
+]

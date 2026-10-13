@@ -1,145 +1,118 @@
-# stack-jail-init — sourced (zsh/sh) inside a per-stack jail before exec'ing claude.
-# Companion to tools/stack-jail.sh (host side), which injects the generic STACK_* env
-# this consumes (normalized from .env.<stack> + the case block + the kube airlock):
-#   STACK_NAME           stack name (kubeconfig context, messages)
-#   STACK_PAT            stack fine-grained PAT (owner identity, stack repos only)
-#   STACK_REPOS          space-separated repos the PAT covers (credential routing)
-#   STACK_HOMELAB_TOKEN  optional branch+PR-only token for homelab pushes
-#   STACK_KUBE_*         short-lived SA token + server + CA + ns (the airlock derivative)
-# Everything here is per-session container state (credential store, kubeconfig,
-# homelab clone, session card) — the container is ephemeral, nothing persists but ~/.claude.
-# Sourced, not executed: exports GH_TOKEN into the claude process. Always returns 0.
+# shellcheck shell=bash
+# stack-jail-init — sourced (bash) inside a per-stack jail before exec'ing claude.
+# Consumes the env tools/stack-jail.sh injects. Everything here is container-local session state
+# (git routing, kubeconfig files, session card); nothing persists but ~/.claude.
+# Sourced, not executed: exports into the claude process. Always returns 0.
 
 _sj_warn() { echo "stack-jail-init: $*" >&2; }
 
-# ── git identity + per-repo credential routing ─────────────────────────────────
-# ~/.gitconfig is container-local: shared identity copied from the read-only base
-# mount, then credential-store config appended. useHttpPath makes the store match
-# per-repo, so the stack PAT and the homelab token route by URL — no credential
-# ever embedded in a remote URL (the FU-002 lesson).
-if [ -f /home/node/.gitconfig-base ]; then
-  cp /home/node/.gitconfig-base "$HOME/.gitconfig"
+# ── git identity + routing through the credential sidecar ───────────────────────────────────────
+# No token and no credential helper in here. Every URL shape of github.com and the client GitLab
+# (https, http, scp-style ssh, ssh://) is rewritten to http://www.<host>:<port>/, which is the
+# gitproxy sidecar: www.<host> resolves to the namespace's loopback (/etc/hosts of the namespace
+# holder), and the sidecar adds the credential and enforces the push allowlist. Repo configs stay
+# as the host wrote them (and are read-only), so the host keeps its own remotes, keys and helpers.
+# `git remote -v` shows the REWRITTEN URL (insteadOf applies there); `git config --get
+# remote.origin.url` shows the configured one. The "www." form is what keeps `gh` working in a repo
+# directory: it normalises www.github.com to github.com, while 127.0.0.1 is an unknown host to it.
+if [ -f /home/claude/.gitconfig-base ]; then cp /home/claude/.gitconfig-base "$HOME/.gitconfig"; else _sj_warn "no .gitconfig-base — set user.name/email"; fi
+git config --global remote.pushDefault origin        # triangular: track upstream, push to the fork
+git config --global push.default current
+if [ -n "${STACK_GITPROXY:-}" ]; then
+  _sj_route() { # <host>: every URL shape of <host> -> http://www.<host>:<port>/
+    local h="${1%%:*}" u
+    for u in "https://$1/" "http://$1/" "https://www.$h/" "git@$1:" "ssh://git@$1/"; do
+      git config --global --add "url.http://www.$h:$STACK_GITPROXY/.insteadOf" "$u"
+    done
+    getent hosts "www.$h" 2>/dev/null | grep -q '^127\.0\.0\.1 ' || _sj_warn "www.$h does not resolve to loopback — git to $1 will NOT reach the sidecar"
+  }
+  _sj_route github.com
+  [ -n "${GITLAB_HOST:-}" ] && _sj_route "$GITLAB_HOST"
+  export GIT_TERMINAL_PROMPT=0                       # a refused request fails; nothing here could answer a prompt
+  _sj_git="GitHub${GITLAB_HOST:+ and GitLab} traffic goes through a credential sidecar (no git token in this jail; git smart-HTTP only, so no API access): remotes show as \`http://www.<host>:$STACK_GITPROXY/…\`, which is that sidecar. Pushes are accepted ONLY to: ${GITPROXY_WRITE:-<none>}."
 else
-  _sj_warn "no .gitconfig-base mount — set user.name/email manually"
+  _sj_git="no credential sidecar this session — public fetches only, every push fails."
 fi
-git config --global credential.helper "store --file $HOME/.git-credentials"
-git config --global credential.https://github.com.useHttpPath true
-
-: > "$HOME/.git-credentials"
-chmod 600 "$HOME/.git-credentials"
-_sj_cred() { # <token> <org/repo> — store entries with and without .git suffix
-  printf 'https://x-access-token:%s@github.com/%s\nhttps://x-access-token:%s@github.com/%s.git\n' \
-    "$1" "$2" "$1" "$2" >> "$HOME/.git-credentials"
-}
-if [ -n "${STACK_PAT:-}" ]; then
-  # Split STACK_REPOS by newline, not by unquoted word-splitting: this file is
-  # sourced under `zsh -c` (stack-jail.sh) and zsh does NOT word-split unquoted
-  # expansions (SH_WORD_SPLIT is off), so `for r in $STACK_REPOS` iterated ONCE
-  # over the whole string → a single malformed store entry (…/oracle-fleet
-  # oracle-iac allure-…) that useHttpPath matches to no real repo. Proven 2026-07-15
-  # in the oracle jail: oracle-iac had no credential (it lacks the incidental local
-  # gh helper that masked the bug for the other repos). tr|read is cross-shell.
-  echo "$STACK_REPOS" | tr ' ' '\n' | while IFS= read -r _sj_repo; do
-    [ -n "$_sj_repo" ] && _sj_cred "$STACK_PAT" "teststuffstash/$_sj_repo"
-  done
-  export GH_TOKEN="$STACK_PAT"
+if [ -n "${GH_TOKEN:-}" ]; then
+  _sj_gh="\`gh\` is authenticated with a public-read-only token (fine-grained, public repositories, no permissions: it only buys the rate limit) and works in a repo directory without \`-R\`. Reads work; EVERY write (pr create/merge/comment, issues, releases) is refused by GitHub — those are the human's, from the host."
 else
-  _sj_warn "STACK_PAT empty (fill ~/Projects/.env.${STACK_NAME:-<stack>}) — git push + gh will not work"
-fi
-if [ -n "${STACK_HOMELAB_TOKEN:-}" ]; then
-  _sj_cred "$STACK_HOMELAB_TOKEN" teststuffstash/homelab
-  # gh against homelab needs this token explicitly (GH_TOKEN is the stack PAT):
-  #   GH_TOKEN=$(git credential fill <<< $'protocol=https\nhost=github.com\npath=teststuffstash/homelab' | sed -n 's/^password=//p') gh pr create -R teststuffstash/homelab ...
+  _sj_gh="\`gh\` has no token here and refuses to run without one. Pull requests and issues are the human's, from the host."
 fi
 
-# ── homelab context: shallow clone, never a host mount ─────────────────────────
-# The host checkout carries gitignored secrets (tofu state, kubeconfig, tfvars);
-# a clone excludes them by construction and is always fresh. Public repo → no token.
-[ -w /workspace ] || sudo chown node:node /workspace
-if [ ! -d /workspace/homelab ]; then
-  git clone --depth 1 https://github.com/teststuffstash/homelab.git /workspace/homelab \
-    || _sj_warn "homelab clone failed — ../homelab context missing"
-fi
-
-# ── kubectl: namespace-admin SA via the airlock token ──────────────────────────
-if [ -n "${STACK_KUBE_TOKEN:-}" ] && [ -n "${STACK_KUBE_SERVER:-}" ]; then
-  # Tokens/CA are single opaque strings; strip any whitespace that snuck in during
-  # transport (a line-wrapped token once produced invalid kubeconfig YAML here).
-  STACK_KUBE_TOKEN=$(printf '%s' "$STACK_KUBE_TOKEN" | tr -d '[:space:]')
-  STACK_KUBE_CA=$(printf '%s' "${STACK_KUBE_CA:-}" | tr -d '[:space:]')
-  mkdir -p "$HOME/.kube"
-  cat > "$HOME/.kube/config" <<EOF
+# ── kubectl: two FILES, never two contexts in one ───────────────────────────────────────────────
+mkdir -p "$HOME/.kube"
+_sj_umask=$(umask); umask 077                           # every file below is born 600: no window before the chmod
+_sj_kubeconfig() { # <file> <context> <server> <ca> <token> <ns> <user>
+  cat > "$1" <<EOT
 apiVersion: v1
 kind: Config
-clusters:
-  - name: homelab
-    cluster:
-      server: ${STACK_KUBE_SERVER}
-      certificate-authority-data: ${STACK_KUBE_CA}
-users:
-  - name: ${STACK_NAME:-stack}-workbench
-    user:
-      token: ${STACK_KUBE_TOKEN}
-contexts:
-  - name: ${STACK_NAME:-stack}
-    context: { cluster: homelab, user: ${STACK_NAME:-stack}-workbench, namespace: ${STACK_KUBE_NS:-default} }
-current-context: ${STACK_NAME:-stack}
-EOF
-  chmod 600 "$HOME/.kube/config"
-  # kubectl itself comes from a devbox (shared /nix store) — the stack's own
-  # devbox.json where it declares kubectl (oracle-fleet does), else the homelab
-  # clone's: cd /workspace/homelab && devbox run -- kubectl get pods
+clusters: [{ name: $2, cluster: { server: "$3", certificate-authority-data: "$4" } }]
+users:    [{ name: $7, user: { token: "$5" } }]
+contexts: [{ name: $2, context: { cluster: $2, user: $7, namespace: "$6" } }]
+current-context: $2
+EOT
+  chmod 600 "$1"
+}
+if [ -n "${STACK_KUBE_TOKEN:-}" ]; then
+  _sj_kubeconfig "$HOME/.kube/kind.yaml" kind-local "$STACK_KUBE_SERVER" "$STACK_KUBE_CA" "$STACK_KUBE_TOKEN" "$STACK_KUBE_NS" "$STACK_KUBE_SA"
+  export KUBECONFIG="$HOME/.kube/kind.yaml"            # plain `kubectl` = the local kind cluster
+  _sj_kind="namespace-admin SA \`$STACK_KUBE_SA\` in \`$STACK_KUBE_NS\` on the local kind cluster (8h token). Destructive verbs are fine here — it is disposable."
 else
-  _sj_warn "no kube token injected — kubectl unavailable this session"
+  _sj_kind="no kind token this session — plain \`kubectl\` is unavailable."
 fi
+if [ -n "${STACK_DEVKUBE_PROXY:-}" ]; then
+  # No credential: the dev proxy sidecar (same network namespace, loopback only) holds the token,
+  # and refuses writes, secrets, exec/attach/portforward and proxying for any client.
+  cat > "$HOME/.kube/dev.yaml" <<EOT
+apiVersion: v1
+kind: Config
+clusters: [{ name: client-dev, cluster: { server: "$STACK_DEVKUBE_PROXY" } }]
+users:    [{ name: via-proxy, user: {} }]
+contexts: [{ name: client-dev, context: { cluster: client-dev, user: via-proxy, namespace: "$STACK_DEVKUBE_NS" } }]
+current-context: client-dev
+EOT
+  _sj_dev="READ-ONLY SA \`$STACK_DEVKUBE_SA\` in \`$STACK_DEVKUBE_NS\` through a proxy that holds the token (8h; GET only, no secrets, no exec). Use \`kdev <verb> ...\`."
+else
+  _sj_dev="no dev credential this session — \`kdev\` is unavailable."
+fi
+if [ -n "${STACK_ARGO_TOKEN:-}" ]; then
+  # The argocd CLI reads these three; the token is the stack's own Argo account, get+sync only, 8h.
+  export ARGOCD_SERVER="$STACK_ARGO_SERVER" ARGOCD_AUTH_TOKEN="$STACK_ARGO_TOKEN" ARGOCD_OPTS="--insecure"
+  _sj_argo="\`argocd app get|sync|wait|logs|diff <app>\` on this stack's Applications (project \`${STACK_NAME:-stack}\`, server \`$STACK_ARGO_SERVER\`, 8h token in \`ARGOCD_AUTH_TOKEN\`, the account disabled at session end; \`argocd\` itself comes from the repo's devbox). The account can get and sync, nothing else: creating, editing or deleting an Application, a repo or an account is refused by the API. Applications pull the chart version the sidecar pushed; auto-sync + self-heal is on, so a hand edit in the namespace is reverted — change the chart and push instead."
+else
+  _sj_argo="no Argo CD token this session — \`argocd\` is unavailable (the stack has no ARGO_APPS, or the launcher's gate refused)."
+fi
+if [ -n "${STACK_BUILD_DIR:-}" ]; then
+  _sj_build="\`build-image <app.jar> --name <name> [--tag T] [--chart chart.tgz] [--env BP_X=y]\` hands the jar (and chart) to a build sidecar that runs the Paketo lifecycle and pushes to \`${STACK_BUILD_REGISTRY}\` — names allowed: ${STACK_BUILD_NAMES}. Nothing in this jail pushes; the sidecar holds the registry credential. Requests and logs: \`${STACK_BUILD_DIR}/<id>/\`."
+else
+  _sj_build="no build sidecar this session — images cannot be built or pushed from here."
+fi
+umask "$_sj_umask"; unset _sj_umask
+export PATH="/workspace/tools:$PATH"                   # kdev, build-image
 
-# ── session card: rendered stack env card + shared container card ──────────────
-# claude-jail#1 two-recipe design: /workspace is container-local here (only tools/
-# and the stack dirs are mounted into it), so the composed card is ephemeral and
-# Claude Code's upward traversal loads it from every stack repo. Stack jails get
-# NO homelab seat card BY DESIGN (the seat card's header states why): the shallow
-# clone's facts-only CLAUDE.md is the right amount of homelab context. Tokens are
-# referenced by PRESENCE only — no secret may be rendered into the card.
-if [ -n "${STACK_HOMELAB_TOKEN:-}" ]; then
-  # $(cat <<'EOF') keeps $(...) and backticks literal — this text must not execute.
-  _sj_hl=$(cat <<'EOF'
-A homelab push token is installed: `agent/*` branches + PRs ONLY (the token's App identity enforces it — direct pushes to master are structurally impossible). `gh` against homelab needs that token explicitly (`GH_TOKEN` is the stack PAT): `GH_TOKEN=$(git credential fill <<< $'protocol=https\nhost=github.com\npath=teststuffstash/homelab' | sed -n 's/^password=//p') gh pr create -R teststuffstash/homelab ...`
-EOF
-)
-else
-  _sj_hl="No homelab push credential this session — treat the clone as read-only."
-fi
-if [ -n "${STACK_KUBE_TOKEN:-}" ] && [ -n "${STACK_KUBE_SERVER:-}" ]; then
-  _sj_kube=$(cat <<EOF
-namespace-admin ServiceAccount \`${STACK_NAME}-workbench\` in namespace \`${STACK_KUBE_NS:-default}\`, via a short-lived token (72h bound) in \`~/.kube/config\`. The \`kubectl\` binary comes from a devbox (shared /nix store): the stack's own \`devbox.json\` if it declares kubectl, else \`cd /workspace/homelab && devbox run -- kubectl ...\`.
-EOF
-)
-else
-  _sj_kube="no kube token was injected this session — kubectl is unavailable."
-fi
+# ── session card ────────────────────────────────────────────────────────────────────────────────
 {
-  cat <<EOF
-# ${STACK_NAME:-stack} stack jail — session card
-<!-- rendered at session start by tools/stack-jail-init.sh from the STACK_* env — edit the renderer (or tools/jail-card.md below), not this file -->
+  cat <<EOT
+# ${STACK_NAME:-stack} jail — session card
+<!-- rendered at session start by tools/stack-jail-init.sh from the injected env — edit the renderer (or tools/jail-card.md below), not this file -->
 
-- **Stack: ${STACK_NAME:-?}.** Only this stack's repos are mounted under \`/workspace\` (plus any private read-only extras) — \`ls /workspace\` shows the full set.
-- **git/gh**: the stack's fine-grained PAT (owner identity) covers ONLY: ${STACK_REPOS:-<none>}. Direct push to master works there (the owner bypasses rulesets). \`gh\` is authenticated via \`GH_TOKEN\`. Known limit: fine-grained PATs have no Checks permission — \`gh pr checks\` 403s; use \`gh run watch\` + the PR's \`mergeStateStatus\` instead.
-- **homelab**: shallow clone at \`/workspace/homelab\`, never the host checkout (it holds gitignored secrets). Its facts-only \`CLAUDE.md\` is your homelab context — this jail gets no homelab seat card by design. ${_sj_hl}
-- **kubectl**: ${_sj_kube}
-- **uploads**: files dropped via the upload UI land in \`${UPLOAD_DIR:-/workspace/uploads}\` (a gitignored inbox) — move them out to commit them.
-- **handoff**: \`/workspace/.handoff\` is this stack's cross-jail channel (protocol: \`tools/handoff.md\`); only this stack's subtree is mounted, other stacks' traffic is invisible here.
+- **Stack: ${STACK_NAME:-?}.** Mounted repos under \`/workspace\`: ${STACK_REPOS:-<none>}. Nothing else of the host is visible.
+- **Read-only views**: $(if [ -n "${STACK_READS:-}" ]; then echo "$(printf '%s' "${STACK_READS}" | tr ' ' '\n' | sed 's|\(.*\):\(.*\)|/reads/\1/\2|' | paste -sd, -) — other stacks' working trees as they are on the host, uncommitted edits included. Read, compare, cite; never try to write, build in, or push from them — their remotes and tokens are not in this jail."; else echo "none this session."; fi)
+- **git**: \`upstream\` is fetch-only; \`origin\` is YOUR fork. ${_sj_git} Pushes are the human's (\`! git push\`); add a Co-Authored-By trailer to commits you author.
+- **gh**: ${_sj_gh}
+- **kubectl (kind)**: ${_sj_kind}
+- **kdev (client dev)**: ${_sj_dev}
+- **build-image**: ${_sj_build}
+- **argocd**: ${_sj_argo}
+- **notes**: \`/workspace/notes\` — the human's and agents' shared, persistent notes for this stack. Never committed to any repo or published; client facts are fine here. A local git repo with no remote: the launcher snapshots it before and after each session, so whatever you write is reviewed. Read it at the start of non-trivial work; write things meant to outlast this session.
+- **uploads**: files dropped via the upload UI land in \`${UPLOAD_DIR:-/workspace/notes/uploads}\` (gitignored inbox, outside every repo).
 
 ---
-EOF
-  if [ -f /workspace/tools/jail-card.md ]; then
-    cat /workspace/tools/jail-card.md
-  else
-    _sj_warn "tools/jail-card.md missing — session card composed WITHOUT the container ground rules"
-    echo "(tools/jail-card.md was missing at composition time — container ground rules absent)"
-  fi
-} > /workspace/CLAUDE.local.md
-unset _sj_hl _sj_kube
+EOT
+  if [ -f /workspace/tools/jail-card.md ]; then cat /workspace/tools/jail-card.md; else _sj_warn "tools/jail-card.md missing"; echo "(ground-rules card missing)"; fi
+} > /workspace/CLAUDE.local.md 2>/dev/null || _sj_warn "could not write /workspace/CLAUDE.local.md"
 
-unset STACK_PAT STACK_HOMELAB_TOKEN STACK_KUBE_TOKEN STACK_KUBE_SERVER STACK_KUBE_CA
-unset -f _sj_warn _sj_cred 2>/dev/null
+unset _sj_kind _sj_dev _sj_git _sj_gh _sj_build _sj_argo        # GH_TOKEN stays: it is gh's, public-read-only, gated by the launcher
+unset STACK_KUBE_TOKEN STACK_KUBE_CA STACK_ARGO_TOKEN            # ARGOCD_AUTH_TOKEN stays: it is argocd's, get+sync only, gated by the launcher
+unset -f _sj_warn _sj_kubeconfig _sj_route 2>/dev/null
 true

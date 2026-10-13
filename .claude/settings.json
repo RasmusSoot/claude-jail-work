@@ -1,7 +1,7 @@
 {
   "statusLine": {
     "type": "command",
-    "command": "/workspace/.claude/statusline.sh",
+    "command": "/workspace/tools/statusline.sh",
     "padding": 1
   }
 }

@@ -1,33 +1,13 @@
-# Each alias publishes its own ports with -p (host:container). The upload UI is
-# always container port 8000; the host port differs per session so they can run
-# at once. Only "main" (general/infra work from ~/Projects) maps the OAuth port
-# 54545, so it's the only session that can complete /login — Claude's callback
-# is hard-fixed to localhost:54545. Log in there once; the token persists in
-# .claude-data/ and every other session reuses it. UPLOAD_DIR is each project's
-# gitignored uploads/ inbox; move files out of there to commit them.
-alias main='JAIL_NAME=main UPLOAD_DIR=/workspace/uploads docker compose -f ~/Projects/docker-compose.yml run --rm -p 8000:8000 -p 54545:54545 claude'
-alias car-fleet='JAIL_NAME=car-fleet UPLOAD_DIR=/workspace/car-fleet/uploads docker compose -f ~/Projects/docker-compose.yml run --rm -p 8001:8000 claude zsh -c "cd /workspace/car-fleet && exec claude"'
-alias homelab='JAIL_NAME=homelab UPLOAD_DIR=/workspace/homelab/uploads docker compose -f ~/Projects/docker-compose.yml run --rm -p 8002:8000 claude zsh -c "cd /workspace/homelab && exec claude"'
-alias life='JAIL_NAME=life UPLOAD_DIR=/workspace/life/uploads docker compose -f ~/Projects/docker-compose.yml run --rm -p 8003:8000 claude zsh -c "cd /workspace/life && exec claude"'
-alias idp='JAIL_NAME=idp UPLOAD_DIR=/workspace/idp/uploads docker compose -f ~/Projects/docker-compose.yml run --rm -p 8004:8000 claude zsh -c "cd /workspace/idp && exec claude"'
-alias sleep-tracking='JAIL_NAME=sleep-tracking UPLOAD_DIR=/workspace/sleep-tracking/uploads docker compose -f ~/Projects/docker-compose.yml run --rm -p 8005:8000 claude zsh -c "cd /workspace/sleep-tracking && exec claude"'
-# Same project, routed through OpenRouter instead of Anthropic. Reuses the
-# sleep-tracking/claude-or wrapper (loads the key from sleep-tracking/.openrouter.env).
-# Distinct upload port (8015) so it can run alongside the native session.
-alias sleep-tracking-or='JAIL_NAME=sleep-tracking-or UPLOAD_DIR=/workspace/sleep-tracking/uploads docker compose -f ~/Projects/docker-compose.yml run --rm -p 8015:8000 claude zsh -c "cd /workspace/sleep-tracking && exec ./claude-or"'
-alias idp-or='JAIL_NAME=idp-or UPLOAD_DIR=/workspace/idp/uploads docker compose -f ~/Projects/docker-compose.yml run --rm claude zsh -c "cd /workspace/idp && exec ./claude-or"'
-alias snore-recorder='JAIL_NAME=snore-recorder UPLOAD_DIR=/workspace/snore-recorder/uploads docker compose -f ~/Projects/docker-compose.yml run --rm -p 8006:8000 claude zsh -c "cd /workspace/snore-recorder && exec claude"'
-alias openrouter-operator='JAIL_NAME=openrouter-operator UPLOAD_DIR=/workspace/openrouter-operator/uploads docker compose -f ~/Projects/docker-compose.yml run --rm -p 8016:8000 claude zsh -c "cd /workspace/openrouter-operator && exec claude"'
-alias teststuff='JAIL_NAME=teststuff UPLOAD_DIR=/workspace/teststuff/uploads docker compose -f ~/Projects/docker-compose.yml run --rm -p 8007:8000 claude zsh -c "cd /workspace/teststuff && exec claude"'
-# oracle STACK-JAIL (not the mono jail): scoped mounts + per-stack tokens + SA kubectl.
-# Shares the mono jail's login (.credentials.json mount) — no /login needed;
-# `oracle --login` exists only for re-auth edge cases (maps 54545, not while main runs).
-alias oracle='~/Projects/tools/stack-jail.sh oracle'
-alias sleep-jail='~/Projects/tools/stack-jail.sh sleep'
-alias platform-jail='~/Projects/tools/stack-jail.sh platform'
-alias circles='~/Projects/tools/stack-jail.sh circles'
-# homelab with OpenCode Go models on the SUBAGENT slots (haiku/sonnet/opus → Go via the
-# local model-splitting shim; the MAIN model — fable — stays on the Anthropic subscription).
-# Slot map: homelab/.opencode-go.env; key: wallet `opencode-go-api-key`. Upload port 8012
-# so it can run alongside the native homelab session (8002).
-alias homelab-go='JAIL_NAME=homelab-go UPLOAD_DIR=/workspace/homelab/uploads docker compose -f ~/Projects/docker-compose.yml run --rm -p 8012:8000 claude zsh -c "cd /workspace/homelab && exec bash scripts/claude-go.sh"'
+# Host-side launch shortcuts. Every published port binds to loopback: a work laptop sits on office
+# and client networks. The upload server also wants the per-session token URL printed at launch.
+#   jail-main  — the login/mechanism jail (this repo mounted). The ONLY session that maps the OAuth
+#                callback 54545, so `/login` happens here once; stack jails reuse the token.
+#   <stack>   — a per-stack jail via tools/stack-jail.sh (config: stacks/<stack>.conf +
+#                ~/claude/jail/.env.<stack>). Add one alias line per stack.
+alias jail-main='JAIL_NAME=main UPLOAD_DIR=/workspace/uploads docker compose -f ~/claude/claude-jail-work/docker-compose.yml run --rm -p 127.0.0.1:8000:8000 -p 127.0.0.1:54545:54545 claude'
+alias jail-pin='~/claude/claude-jail-work/tools/pin-aliases.sh'   # review + pin this file for the host shell
+alias siva='~/claude/claude-jail-work/tools/stack-jail.sh siva'
+alias siga='~/claude/claude-jail-work/tools/stack-jail.sh siga'
+alias tara='~/claude/claude-jail-work/tools/stack-jail.sh tara'
+alias govsso='~/claude/claude-jail-work/tools/stack-jail.sh govsso'
+alias ai-governance='~/claude/claude-jail-work/tools/stack-jail.sh ai-governance'

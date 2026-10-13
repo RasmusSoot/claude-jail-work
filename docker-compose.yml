@@ -1,4 +1,7 @@
 services:
+  # LOGIN / MECHANISM jail: mounts only THIS repo. The only session that maps the OAuth callback
+  # port 54545 (via the `jail-main` alias), so log in here once; every stack jail shares the token
+  # through the single-file .credentials.json mount below.
   claude:
     build:
       context: .
@@ -7,54 +10,41 @@ services:
         HOST_GID: ${HOST_GID}
     working_dir: /workspace
     environment:
-      # Folder the auto-started upload server drops files into (a gitignored
-      # uploads/ inbox, set per project in .aliases). Server always on port 8000.
+      TZ: ${TZ:-Europe/Tallinn}
+      TERM: xterm-256color
+      COLORTERM: truecolor
       UPLOAD_DIR: ${UPLOAD_DIR:-/workspace/uploads}
-      # Per-jail identity on the OTLP telemetry (homelab#566): the collector already
-      # promotes resource attrs to metric labels, so jail_name lands in Prometheus and
-      # `sum by (jail_name, session_id)` answers "which jail burned what". JAIL_NAME is
-      # set by each alias in .aliases (default main). This is the SINGLE writer of
-      # OTEL_RESOURCE_ATTRIBUTES — the old copy in .claude-data/settings.json was
-      # removed 2026-08-18 (a shared-file value cannot differ per container, and env
-      # precedence between the two sources is ambiguity nobody needs).
-      OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,stack=jail,jail.name=${JAIL_NAME:-main}
+      # Per-jail OTLP identity. NOTE: an employer-managed policy delivered through the login
+      # (remote managed settings) may set OTEL_RESOURCE_ATTRIBUTES itself; the managed value wins.
+      OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,jail.name=${JAIL_NAME:-main}
     volumes:
-      - ${HOME}/Projects:/workspace
-      - ${HOME}/Projects/.claude-data:/home/node/.claude
-      # Overlay the credentials file as a SINGLE-FILE mount on top of the dir
-      # mount, matching the stack service. On a file mountpoint the CLI's atomic
-      # rename fails (EBUSY) and it falls back to an in-place copy, so the host
-      # inode never changes. Without this, a mono-jail token refresh renames a
-      # new inode into .claude-data/ and every stack jail (pinned to the old
-      # inode by its file mount) drifts stale → "Login expired" within ~8h.
-      - ${HOME}/Projects/.claude-data/.credentials.json:/home/node/.claude/.credentials.json
-      - ${HOME}/Projects/.claude-data.json:/home/node/.claude.json
-      # Jail-only git identity. Host ~/.gitconfig is deliberately NOT mounted so
-      # the jail can use its own author name/email. Edit .claude-data.gitconfig.
-      - ${HOME}/Projects/.claude-data.gitconfig:/home/node/.gitconfig
-      # Shared Nix store so Devbox tooling (per-project devbox.json) works identically in
-      # the jail and on the host. Requires Nix/Devbox installed on the host (it provides /nix).
-      - /nix:/nix
-    # No ports: here on purpose. Each alias in .aliases publishes its own host
-    # ports with -p (e.g. -p 8001:8000), so sessions don't collide and only the
-    # main jail maps the OAuth port 54545.
+      - .:/workspace
+      - ${JAIL_HOME}/.claude-data:/home/claude/.claude
+      # Single-file overlay on top of the dir mount: on a file mountpoint the CLI's atomic rename
+      # fails (EBUSY) and it falls back to an in-place write, so the host inode never changes and
+      # every stack jail (pinned to that inode by its own file mount) sees token refreshes.
+      - ${JAIL_HOME}/.claude-data/.credentials.json:/home/claude/.claude/.credentials.json
+      - ${JAIL_HOME}/.claude-data.json:/home/claude/.claude.json
+      # Jail-only git identity; the host ~/.gitconfig is deliberately NOT mounted.
+      - ${JAIL_HOME}/.claude-data.gitconfig:/home/claude/.gitconfig
+      # Jail-only Nix store (named volume, seeded from the image) — never the host's /nix.
+      - jail-nix:/nix
+    # No ports: here on purpose — aliases publish them, loopback only.
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     stdin_open: true
     tty: true
     env_file:
       - .env
 
-  # Generic STACK-JAIL service (middle-ground permissions, see tools/stack-jail.sh
-  # header). One service for every per-stack jail — everything stack-specific
-  # (project mounts, state files, tokens, UPLOAD_DIR) is passed by the launcher
-  # via `docker compose run -v/-e`, so a new stack jail is a case-block entry in
-  # tools/stack-jail.sh, not a compose edit. Never `docker compose run stack`
-  # directly. Differences from `claude` on purpose:
-  #   - NO ~/Projects mount: only the stack dirs the launcher passes (homelab is
-  #     shallow-cloned inside by tools/stack-jail-init.sh — the host checkout
-  #     holds gitignored secrets: tofu state, kubeconfigs)
-  #   - per-stack .claude-data-<stack> state (the mono jail's ~/.claude holds
-  #     the homelab-* secret dirs; they must not leak into a stack jail)
-  #   - no .env: the launcher sources .env.<stack> and passes only its keys
+  # PER-STACK jail. One generic service; everything stack-specific (repo mounts, state files,
+  # tokens, kubeconfig material) is passed by tools/stack-jail.sh via `docker compose run -v/-e`.
+  # Never `docker compose run stack` directly. Differences from `claude` on purpose:
+  #   - no repo mount of this repo except tools/ (read-only): the upload server, init, kdev
+  #   - per-stack ~/.claude state; only the credentials file crosses over from the login jail
+  #   - no networks of its own: it joins the namespace of a pause container the launcher starts
+  #     (per-stack bridge + kind network + published ports), shared with the git and dev proxy sidecars
+  #   - no git token: the gitproxy sidecar below holds them and the jail's git is routed to it
   stack:
     build:
       context: .
@@ -63,20 +53,50 @@ services:
         HOST_GID: ${HOST_GID}
     working_dir: /workspace
     environment:
-      # Same per-jail OTLP identity as the claude service (homelab#566); stack-jail.sh
-      # sets JAIL_NAME="<stack>-stack" and passes it through.
-      OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,stack=jail,jail.name=${JAIL_NAME:-stack}
+      TZ: ${TZ:-Europe/Tallinn}
+      TERM: xterm-256color
+      COLORTERM: truecolor
+      OTEL_RESOURCE_ATTRIBUTES: service.name=claude-code,role=jail,jail.name=${JAIL_NAME:-stack},jail.reads=${JAIL_READS:-none}
     volumes:
-      # tools/ read-only: the upload server + stack-jail-init.sh live here
-      - ${HOME}/Projects/tools:/workspace/tools:ro
-      # Subscription OAuth shared with the mono jail — the proven login-once
-      # pattern (multiple jail sessions already share this file live). Only the
-      # credentials file crosses over; the rest of .claude-data/ (homelab-*
-      # secret dirs) stays out of stack jails.
-      - ${HOME}/Projects/.claude-data/.credentials.json:/home/node/.claude/.credentials.json
-      # Shared jail git identity, read-only at a side path; stack-jail-init.sh
-      # copies it to ~/.gitconfig and appends the per-repo credential config.
-      - ${HOME}/Projects/.claude-data.gitconfig:/home/node/.gitconfig-base:ro
-      - /nix:/nix
+      - ./tools:/workspace/tools:ro
+      - ${JAIL_HOME}/.claude-data.gitconfig:/home/claude/.gitconfig-base:ro
+      - jail-nix-stack:/nix               # one store PER STACK: a jail must not tamper with another client's tools
+      - jail-m2-stack:/home/claude/.m2    # per-stack Maven cache: a full build per session is too slow; same trust as the Nix store
+    network_mode: "container:${JAIL_NETNS:-launch-via-tools-stack-jail-sh}"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     stdin_open: true
     tty: true
+
+  # GIT CREDENTIAL SIDECAR for a stack jail: tools/gitproxy/gitproxy.py, the same image with python3.
+  # Started by tools/stack-jail.sh into the jail's network namespace, holding the GitHub/GitLab
+  # tokens the jail no longer gets; the jail's git reaches it on 127.0.0.1:8002 via url.insteadOf.
+  # Same posture as the dev proxy: read-only root, no capabilities, no networks of its own.
+  gitproxy:
+    build:
+      context: .
+      args:
+        HOST_UID: ${HOST_UID}
+        HOST_GID: ${HOST_GID}
+    entrypoint: ["/usr/bin/tini", "-g", "--", "python3", "/workspace/tools/gitproxy/gitproxy.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./tools:/workspace/tools:ro
+    network_mode: "container:${JAIL_NETNS:-launch-via-tools-stack-jail-sh}"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+volumes:
+  # Jail-only Nix stores, isolated from the host and from each other: one for the login jail, one per
+  # stack (docker volume `jail-nix-<stack>`). `docker volume rm` one to reset it; the next start
+  # re-seeds it from the image.
+  jail-nix:
+  jail-nix-stack:
+    name: jail-nix-${STACK_NAME:-unset}
+  # Per-stack Maven local repository (`docker volume rm jail-m2-<stack>` resets it).
+  jail-m2-stack:
+    name: jail-m2-${STACK_NAME:-unset}
+
