@@ -226,8 +226,9 @@ jwt_sub() { # decode the JWT payload locally (base64url + padding) and print .su
 # kind nodes are PRIVILEGED containers: a namespace admin who may run a privileged / hostPath /
 # hostPID pod is root on the node and, through it, likely on the host. So before minting, the
 # namespace must enforce Pod Security baseline or restricted (both forbid those pods), and the SA
-# must not be able to take that away: no patch/update/delete of its namespace, no creating
-# namespaces (a fresh one would have no label), no creating pods anywhere else. The label, the SA
+# must not be able to take that away: no patch/update/delete of any namespace, no creating
+# namespaces (a fresh one would have no label), no kubelet reach, and nothing beyond read-only
+# (no shell subresource either) in any namespace but its own. The label, the SA
 # and its RoleBinding are applied by tools/kind-stack.sh <stack> up (host-side, from the conf):
 #   pod-security.kubernetes.io/enforce: baseline     # or restricted
 rules_not_readonly() { # stdin: `kubectl auth can-i --list` output → every row allowing more than get/list/watch, or any secrets read
@@ -279,9 +280,10 @@ kind_psa_gate() {
   # Deployment, Job, pods/exec or an ephemeral container runs a privileged container just as well);
   # WITH one, nothing may patch/update/delete namespaces (that is the label) or reach the kubelet
   # (nodes/proxy; a cluster-wide grant shows in every namespace's list, and kubelet exec bypasses
-  # Pod Security). pods/exec etc. are fine there: the stack namespace is namespace-admin by design,
-  # and the label bounds what a pod there can be. A namespace list that fails or comes back empty
-  # refuses too: no list, no gate.
+  # Pod Security); in the STACK namespace pods/exec etc. are fine (namespace-admin by design, the
+  # label bounds what a pod there can be), in any other labelled namespace a shell subresource is
+  # refused too (an exec into a pod of argocd's, say, is a cluster-admin shell). A namespace list
+  # that fails or comes back empty refuses too: no list, no gate.
   local ns lbl nslist perms v
   if ! nslist=$("${kk[@]}" get ns -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.pod-security\.kubernetes\.io/enforce}{"\n"}{end}' 2>"$ERR_DIR/kind-ns.err") || [ -z "$nslist" ]; then
     fail "kind gate REFUSED: cannot list namespaces on kind-$KIND_CLUSTER. kubectl said:"; sed 's/^/    /' "$ERR_DIR/kind-ns.err" | head -3 >&2; return 1
@@ -290,7 +292,9 @@ kind_psa_gate() {
     [ -n "$ns" ] || continue
     if ! perms=$("${kk[@]}" auth can-i --list -n "$ns" --as="$as" 2>/dev/null); then bad="$bad no-rule-list-for-$ns"; continue; fi
     case "$lbl" in
-      baseline|restricted) v=$(printf '%s\n' "$perms" | rules_write_namespaces | head -1) ;;
+      baseline|restricted)
+        if [ "$ns" = "$KIND_NS" ]; then v=$(printf '%s\n' "$perms" | rules_write_namespaces | head -1)
+        else v=$( { printf '%s\n' "$perms" | rules_write_namespaces; printf '%s\n' "$perms" | rules_not_readonly | grep -F 'a shell or the kubelet'; } | head -1); fi ;;
       *) v=$(printf '%s\n' "$perms" | rules_not_readonly | head -1) ;;
     esac
     [ -z "$v" ] || bad="$bad $ns:[$v]"

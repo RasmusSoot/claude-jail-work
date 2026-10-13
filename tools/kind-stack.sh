@@ -35,7 +35,8 @@
 #                     and charts/<name> for each, nothing else. Re-run `up` after changing them.
 # The registry is per stack: container `jail-<stack>-registry` (Zot, REGISTRY_IMAGE), volume
 # `jail-registry-<stack>`, reachable as jail-<stack>-registry:5000 on the kind network — which is
-# what the launcher's BUILD_REGISTRY defaults to. Anyone may pull; pushes need the credential
+# what the launcher's BUILD_REGISTRY defaults to; it runs as the host user with no capability, its
+# storage in ~/claude/jail/.registry-<stack>-data/. Anyone may pull; pushes need the credential
 # REGISTRY_PUSH_USER/PASSWORD from ~/claude/jail/.env.<stack>, which `up` generates and writes there
 # when absent and which the launcher hands to the build sidecar only. Its bcrypt hash and the policy
 # live in ~/claude/jail/.registry-<stack>/ (host-only). Idempotent; re-run after changing the conf.
@@ -61,7 +62,8 @@ REG_DIR="$JAIL_HOME/.registry-$STACK"                             # policy + bcr
 ARGO_APPS="${ARGO_APPS:-}"; ARGO_VERSION="${ARGO_VERSION:-v3.5.5}"; ARGO_NODEPORT="${ARGO_NODEPORT:-30443}"
 ARGO_NS=argocd; ARGO_ACCOUNT="$STACK-jail"                   # the account the launcher mints session tokens for
 ARGO_UI_PORT="${ARGO_UI_PORT:-8443}"
-REG="jail-$STACK-registry"; REG_VOL="jail-registry-$STACK"; CTX="kind-$KIND_CLUSTER"
+REG="jail-$STACK-registry"; REG_VOL="jail-registry-$STACK"; CTX="kind-$KIND_CLUSTER"   # REG_VOL: the old root-owned volume, removed when met
+REG_DATA="$JAIL_HOME/.registry-$STACK-data"                       # layers and charts, owned by the host user (the registry runs as that user)
 kc() { kubectl --context "$CTX" "$@"; }
 
 running() { [ "$(docker container inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
@@ -125,27 +127,30 @@ registry_up() {
     printf '%s' "$src" > "$REG_DIR/htpasswd.src"; changed=1
   fi
   unset PUSH_PASS
+  mkdir -p "$REG_DATA"; chmod 700 "$REG_DATA"
   if docker container inspect "$REG" >/dev/null 2>&1; then
     have=$(docker container inspect -f '{{.Config.Image}}' "$REG")
-    # Run flags belong to the container, not the image: one made without DAC_READ_SEARCH (an older
-    # version of this script, with or without --cap-drop) is recreated on the same volume.
-    if ! docker container inspect -f '{{.HostConfig.CapAdd}}' "$REG" 2>/dev/null | grep -q DAC_READ_SEARCH; then
-      docker rm -f "$REG" >/dev/null; ok "registry: $REG recreated with its current run flags (volume kept)"
-    elif [ "$have" != "$REGISTRY_IMAGE" ]; then
-      # A different registry program: its storage layout does not carry over. The volume is a
-      # cache (layers, charts the sidecar rebuilds in minutes), so recreate rather than migrate.
-      docker rm -f "$REG" >/dev/null; docker volume rm "$REG_VOL" >/dev/null 2>&1 || true
-      ok "registry: $REG was $have — recreated as $REGISTRY_IMAGE with a fresh volume (cache and charts dropped; rebuild and push again)"
+    if [ "$have" != "$REGISTRY_IMAGE" ]; then
+      # A different registry program: its storage layout does not carry over. Storage is a cache
+      # (layers, charts the sidecar rebuilds in minutes), so recreate rather than migrate.
+      docker rm -f "$REG" >/dev/null; rm -rf "$REG_DATA"; mkdir -p "$REG_DATA"; chmod 700 "$REG_DATA"
+      ok "registry: $REG was $have — recreated as $REGISTRY_IMAGE with fresh storage (cache and charts dropped; rebuild and push again)"
+    elif [ "$(docker container inspect -f '{{.Config.User}}|{{.HostConfig.CapAdd}}' "$REG" 2>/dev/null)" != "$(id -u):$(id -g)|[]" ]; then
+      # Run flags belong to the container, not the image: one made by an older version of this
+      # script (root, a capability, a root-owned volume) is recreated as the host user on the data dir.
+      docker rm -f "$REG" >/dev/null; ok "registry: $REG recreated as the host user with no capability (storage moves to $REG_DATA; cache and charts dropped; rebuild and push again)"
     fi
   fi
+  docker volume rm "$REG_VOL" >/dev/null 2>&1 || true            # the old root-owned volume, once nothing uses it
   if ! docker container inspect "$REG" >/dev/null 2>&1; then
     local pub=(); [ -z "$REGISTRY_PORT" ] || pub=(-p "127.0.0.1:$REGISTRY_PORT:5000")
-    # Zot runs as root; with every capability dropped that root cannot enter the host-owned,
-    # mode-700 config dir or read the mode-600 htpasswd. DAC_READ_SEARCH is the read-side bypass
-    # only (no writes, no chown): the dir and the hash stay private on the host.
-    docker run -d --restart=always --name "$REG" --cap-drop ALL --cap-add DAC_READ_SEARCH --security-opt no-new-privileges \
-      -v "$REG_VOL:/var/lib/registry" -v "$REG_DIR:/etc/zot:ro" ${pub[@]+"${pub[@]}"} "$REGISTRY_IMAGE" >/dev/null
-    created=1; ok "registry: created $REG (volume $REG_VOL${REGISTRY_PORT:+, host 127.0.0.1:$REGISTRY_PORT}; pull anonymous, push as $PUSH_USER)"
+    # As the host user, with every capability dropped: it reads the host-owned, mode-700 config
+    # dir as its owner, and writes storage the owner owns. Not root with DAC_READ_SEARCH — under
+    # Docker's default seccomp profile that capability re-enables open_by_handle_at, i.e. a
+    # compromised registry reading any file on the host filesystem behind the bind mount.
+    docker run -d --restart=always --name "$REG" --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
+      -v "$REG_DATA:/var/lib/registry" -v "$REG_DIR:/etc/zot:ro" ${pub[@]+"${pub[@]}"} "$REGISTRY_IMAGE" >/dev/null
+    created=1; ok "registry: created $REG (storage $REG_DATA${REGISTRY_PORT:+, host 127.0.0.1:$REGISTRY_PORT}; pull anonymous, push as $PUSH_USER)"
   elif ! running "$REG"; then
     docker start "$REG" >/dev/null; ok "registry: started $REG"
   elif [ "$changed" = 1 ]; then
@@ -256,8 +261,9 @@ EOT
 
 # What the launcher's kind gate checks before minting (tools/stack-jail.sh kind_psa_gate): the
 # namespace enforces Pod Security baseline, and the SA, bound to the built-in `admin` ClusterRole
-# by a namespaced RoleBinding, cannot patch/delete the namespace, create namespaces, or create
-# pods elsewhere. Nothing more: everything else the stack deploys is the lab's, inside this namespace.
+# by a namespaced RoleBinding, cannot patch/delete any namespace, create namespaces, reach the
+# kubelet, or hold more than get/list/watch (and no shell subresource) in any namespace but this
+# one. Nothing more: everything else the stack deploys is the lab's, inside this namespace.
 stack_rbac() {
   kc apply -f - >/dev/null <<EOT
 apiVersion: v1
@@ -442,7 +448,7 @@ case "$ACTION" in
           exec kubectl --context "$CTX" -n "$ARGO_NS" port-forward --address 127.0.0.1 svc/argocd-server "$ARGO_UI_PORT:443" ;;
   down)   cluster_exists && kind delete cluster --name "$KIND_CLUSTER"; info "registry $REG kept (layer cache); 'purge' removes it" ;;
   purge)  cluster_exists && kind delete cluster --name "$KIND_CLUSTER"
-          docker rm -f "$REG" >/dev/null 2>&1 || true; docker volume rm "$REG_VOL" >/dev/null 2>&1 || true; rm -rf "$REG_DIR"
-          ok "removed cluster $KIND_CLUSTER, registry $REG, volume $REG_VOL and $REG_DIR (the credential stays in $ENV_FILE)" ;;
+          docker rm -f "$REG" >/dev/null 2>&1 || true; docker volume rm "$REG_VOL" >/dev/null 2>&1 || true; rm -rf "$REG_DIR" "$REG_DATA"
+          ok "removed cluster $KIND_CLUSTER, registry $REG, its storage $REG_DATA and $REG_DIR (the credential stays in $ENV_FILE)" ;;
   *) echo "usage: kind-stack.sh <stack> up|status|ui|registry-config|argo-policy|down|purge" >&2; exit 2 ;;
 esac
