@@ -127,7 +127,11 @@ registry_up() {
   unset PUSH_PASS
   if docker container inspect "$REG" >/dev/null 2>&1; then
     have=$(docker container inspect -f '{{.Config.Image}}' "$REG")
-    if [ "$have" != "$REGISTRY_IMAGE" ]; then
+    # Run flags belong to the container, not the image: one made without DAC_READ_SEARCH (an older
+    # version of this script, with or without --cap-drop) is recreated on the same volume.
+    if ! docker container inspect -f '{{.HostConfig.CapAdd}}' "$REG" 2>/dev/null | grep -q DAC_READ_SEARCH; then
+      docker rm -f "$REG" >/dev/null; ok "registry: $REG recreated with its current run flags (volume kept)"
+    elif [ "$have" != "$REGISTRY_IMAGE" ]; then
       # A different registry program: its storage layout does not carry over. The volume is a
       # cache (layers, charts the sidecar rebuilds in minutes), so recreate rather than migrate.
       docker rm -f "$REG" >/dev/null; docker volume rm "$REG_VOL" >/dev/null 2>&1 || true
@@ -136,7 +140,10 @@ registry_up() {
   fi
   if ! docker container inspect "$REG" >/dev/null 2>&1; then
     local pub=(); [ -z "$REGISTRY_PORT" ] || pub=(-p "127.0.0.1:$REGISTRY_PORT:5000")
-    docker run -d --restart=always --name "$REG" --cap-drop ALL --security-opt no-new-privileges \
+    # Zot runs as root; with every capability dropped that root cannot enter the host-owned,
+    # mode-700 config dir or read the mode-600 htpasswd. DAC_READ_SEARCH is the read-side bypass
+    # only (no writes, no chown): the dir and the hash stay private on the host.
+    docker run -d --restart=always --name "$REG" --cap-drop ALL --cap-add DAC_READ_SEARCH --security-opt no-new-privileges \
       -v "$REG_VOL:/var/lib/registry" -v "$REG_DIR:/etc/zot:ro" ${pub[@]+"${pub[@]}"} "$REGISTRY_IMAGE" >/dev/null
     created=1; ok "registry: created $REG (volume $REG_VOL${REGISTRY_PORT:+, host 127.0.0.1:$REGISTRY_PORT}; pull anonymous, push as $PUSH_USER)"
   elif ! running "$REG"; then
