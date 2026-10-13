@@ -221,9 +221,16 @@ registry_wire() {
   for _ in 1 2 3 4 5 6 7 8 9 10; do running "$REG" && break; sleep 1; done
   running "$REG" || { fail "registry: $REG is not running (docker logs --tail 20 $REG)"; return 1; }
   if ! docker network inspect "$KIND_NET" -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -qw "$REG"; then
-    for _ in 1 2 3 4 5; do docker network connect "$KIND_NET" "$REG" 2>/dev/null && break; sleep 2; done
+    local err=""
+    for _ in 1 2 3 4 5; do
+      err=$(docker network connect "$KIND_NET" "$REG" 2>&1) && break
+      # A failed attempt (the sandbox race above) can leave a stale endpoint behind that is not
+      # listed under the network's containers but blocks the next connect: drop it and retry.
+      case "$err" in *"already exists"*|*"endpoint with name"*) docker network disconnect -f "$KIND_NET" "$REG" >/dev/null 2>&1 || true ;; esac
+      sleep 2
+    done
     docker network inspect "$KIND_NET" -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -qw "$REG" \
-      || { fail "registry: could not join $REG to network $KIND_NET (docker network connect $KIND_NET $REG)"; return 1; }
+      || { fail "registry: could not join $REG to network $KIND_NET. docker said: ${err:-nothing}"; return 1; }
     ok "registry: joined network $KIND_NET"
   fi
   if [ -n "$REGISTRY_PORT" ]; then
