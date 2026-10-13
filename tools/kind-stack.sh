@@ -189,9 +189,16 @@ cluster_up() {
     {
       # DenyServiceExternalIPs: a namespace admin could otherwise give a Service the node's own
       # address and have kube-proxy hand it the launcher's traffic to Argo CD (CVE-2020-8554).
+      # config_path: containerd reads the per-registry hosts.toml files registry_wire writes only
+      # when told where they are (newer containerd defaults to this dir, 2.1 in current kindest
+      # images does not; kind's own local-registry docs set it explicitly).
       cat <<EOT
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
+containerdConfigPatches:
+- |-
+  [plugins."io.containerd.grpc.v1.cri".registry]
+    config_path = "/etc/containerd/certs.d"
 nodes:
 - role: control-plane
   kubeadmConfigPatches:
@@ -222,6 +229,14 @@ EOT
 registry_wire() {
   local n host
   for n in $(nodes); do
+    # A node made before the create-time patch above: add the setting and restart containerd
+    # (pods keep running; the kubelet reconnects). Without it the hosts.toml below is never read
+    # and the node speaks HTTPS to the plain-HTTP registry.
+    if ! docker exec "$n" grep -q 'config_path' /etc/containerd/config.toml; then
+      printf '\n[plugins."io.containerd.grpc.v1.cri".registry]\n  config_path = "/etc/containerd/certs.d"\n' | docker exec -i "$n" sh -c 'cat >> /etc/containerd/config.toml'
+      docker exec "$n" systemctl restart containerd
+      ok "registry: $n's containerd now reads /etc/containerd/certs.d (setting added, containerd restarted)"
+    fi
     for host in "$REG:5000" ${REGISTRY_PORT:+"localhost:$REGISTRY_PORT"}; do
       docker exec "$n" mkdir -p "/etc/containerd/certs.d/$host"
       printf '[host."http://%s:5000"]\n' "$REG" | docker exec -i "$n" cp /dev/stdin "/etc/containerd/certs.d/$host/hosts.toml"
