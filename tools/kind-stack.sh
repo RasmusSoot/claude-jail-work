@@ -192,6 +192,13 @@ cluster_up() {
       # config_path: containerd reads the per-registry hosts.toml files registry_wire writes only
       # when told where they are (newer containerd defaults to this dir, 2.1 in current kindest
       # images does not; kind's own local-registry docs set it explicitly).
+      # The admission patch comes in both kubeadm API versions: kind applies a patch to the
+      # generated document whose kind AND apiVersion it names and drops the other (pkg/internal/
+      # patch), and which version kind generates follows the NODE IMAGE (0.32: v1beta4 from
+      # v1.36, v1beta3 below), so KIND_NODE_IMAGE decides, not the kind binary. Patches are RFC
+      # 7386 merges: the v1beta4 list replaces kind's whole list, so it repeats what kind puts
+      # there (runtime-config, empty by default). NodeRestriction is kubeadm's default; this key
+      # replaces the default, so it is kept.
       cat <<EOT
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -203,18 +210,27 @@ nodes:
 - role: control-plane
   kubeadmConfigPatches:
   - |
+    apiVersion: kubeadm.k8s.io/v1beta3
     kind: ClusterConfiguration
     apiServer:
-      extraArgs:                                  # kubeadm v1beta3 map form (what kind 0.29 generates; v1beta4 would take a list)
-        enable-admission-plugins: NodeRestriction,DenyServiceExternalIPs   # NodeRestriction is kubeadm's default: this key replaces it, so it is kept
+      extraArgs:
+        enable-admission-plugins: NodeRestriction,DenyServiceExternalIPs
+  - |
+    apiVersion: kubeadm.k8s.io/v1beta4
+    kind: ClusterConfiguration
+    apiServer:
+      extraArgs:
+      - name: runtime-config
+        value: ""
+      - name: enable-admission-plugins
+        value: NodeRestriction,DenyServiceExternalIPs
 EOT
       if [ -n "$KIND_HTTP_PORT" ]; then
+        # labels: kind's own node field (it renders the kubelet node-labels arg in whichever kubeadm
+        # version it generates); a kubeletExtraArgs patch would hit the same map/list split as above.
         cat <<EOT
-  - |
-    kind: InitConfiguration
-    nodeRegistration:
-      kubeletExtraArgs:
-        node-labels: "ingress-ready=true"
+  labels:
+    ingress-ready: "true"
   extraPortMappings:
   - { containerPort: 80, hostPort: $KIND_HTTP_PORT, listenAddress: "127.0.0.1", protocol: TCP }
 EOT
