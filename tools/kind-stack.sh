@@ -215,8 +215,17 @@ registry_wire() {
       printf '[host."http://%s:5000"]\n' "$REG" | docker exec -i "$n" cp /dev/stdin "/etc/containerd/certs.d/$host/hosts.toml"
     done
   done
-  docker network inspect "$KIND_NET" -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -qw "$REG" \
-    || { docker network connect "$KIND_NET" "$REG"; ok "registry: joined network $KIND_NET"; }
+  # A container that is (re)starting has no network sandbox yet, and `network connect` then fails
+  # with "network sandbox for container … not found": wait for the registry to run, then retry.
+  local _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do running "$REG" && break; sleep 1; done
+  running "$REG" || { fail "registry: $REG is not running (docker logs --tail 20 $REG)"; return 1; }
+  if ! docker network inspect "$KIND_NET" -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -qw "$REG"; then
+    for _ in 1 2 3 4 5; do docker network connect "$KIND_NET" "$REG" 2>/dev/null && break; sleep 2; done
+    docker network inspect "$KIND_NET" -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -qw "$REG" \
+      || { fail "registry: could not join $REG to network $KIND_NET (docker network connect $KIND_NET $REG)"; return 1; }
+    ok "registry: joined network $KIND_NET"
+  fi
   if [ -n "$REGISTRY_PORT" ]; then
     kc apply -f - >/dev/null <<EOT
 apiVersion: v1
