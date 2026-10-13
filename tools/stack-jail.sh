@@ -244,24 +244,27 @@ rules_not_readonly() { # stdin: `kubectl auth can-i --list` output → every row
     res ~ /^(\*|\*\.\*|secrets(\..*)?)$/ { print res " [" verbs "] (covers secrets)" }   # any read of secrets leaks them
   '
 }
-rules_write_namespaces() { # stdin: the same → rows that let the subject patch/update/delete namespaces (the Pod Security label)
+rules_write_namespaces() { # stdin: the same → rows that let the subject patch/update/delete namespaces (the Pod Security label),
+                           # or reach the kubelet (nodes/proxy with any verb; nodes is cluster-scoped, so it shows in every namespace's list)
   awk '
     NR == 1 || NF == 0 { next }
     !match($0, /\[[^][]*\]$/) { print "unparseable: " $0; next }
     { verbs = substr($0, RSTART + 1, RLENGTH - 2) }
-    $1 ~ /^(namespaces|\*|\*\.\*)$/ && verbs ~ /(^| )(patch|update|delete|\*)( |$)/ { print $1 " [" verbs "]" }
+    $1 ~ /^(namespaces|\*|\*\.\*)$/ && verbs ~ /(^| )(patch|update|delete|\*)( |$)/ { print $1 " [" verbs "]"; next }
+    $1 ~ /^nodes\/proxy$/ { print $1 " [" verbs "] (the kubelet API: exec past Pod Security)"; next }
+    $1 ~ /^nodes$/ && verbs ~ /(^| )(patch|update|delete|create|\*)( |$)/ { print $1 " [" verbs "]" }
   '
 }
 kind_psa_gate() {
   local kk=(kubectl --context "kind-$KIND_CLUSTER") as="system:serviceaccount:$KIND_NS:$KIND_SA" psa bad=""
   # A failed read is not "label unset": the API may be down or the namespace missing. Say which.
   if ! psa=$("${kk[@]}" get ns "$KIND_NS" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>"$ERR_DIR/kind-ns.err"); then
-    fail "ABORT kind: cannot read namespace $KIND_NS on kind-$KIND_CLUSTER (cluster down? namespace missing?). kubectl said:"
+    fail "kind gate REFUSED: cannot read namespace $KIND_NS on kind-$KIND_CLUSTER (cluster down? namespace missing?). kubectl said:"
     sed 's/^/    /' "$ERR_DIR/kind-ns.err" | head -3 >&2; return 1
   fi
   case "$psa" in
     baseline|restricted) ;;
-    *) fail "ABORT kind: namespace $KIND_NS has pod-security.kubernetes.io/enforce='${psa:-<unset>}' — needs baseline or restricted"; return 1 ;;
+    *) fail "kind gate REFUSED: namespace $KIND_NS has pod-security.kubernetes.io/enforce='${psa:-<unset>}' — needs baseline or restricted"; return 1 ;;
   esac
   # A request on namespaces/<ns> is evaluated WITH namespace=<ns>, so RoleBindings inside that
   # namespace count: ask with -n, or a binding there (one a pushed chart made Argo create, say)
@@ -274,19 +277,20 @@ kind_psa_gate() {
   # out of reach, which hides a grant in `default`), from the SA's whole rule list there: WITHOUT a
   # Pod Security label it must be read-only and secret-free (not just "no create pods": a
   # Deployment, Job, pods/exec or an ephemeral container runs a privileged container just as well);
-  # WITH one, nothing may patch/update/delete namespaces (that is the label), and the shell and
-  # kubelet subresources are refused there too (a cluster-wide nodes/proxy grant shows in every
-  # namespace's list, and kubelet exec bypasses Pod Security). A namespace list that fails or comes
-  # back empty refuses too: no list, no gate.
+  # WITH one, nothing may patch/update/delete namespaces (that is the label) or reach the kubelet
+  # (nodes/proxy; a cluster-wide grant shows in every namespace's list, and kubelet exec bypasses
+  # Pod Security). pods/exec etc. are fine there: the stack namespace is namespace-admin by design,
+  # and the label bounds what a pod there can be. A namespace list that fails or comes back empty
+  # refuses too: no list, no gate.
   local ns lbl nslist perms v
   if ! nslist=$("${kk[@]}" get ns -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.pod-security\.kubernetes\.io/enforce}{"\n"}{end}' 2>"$ERR_DIR/kind-ns.err") || [ -z "$nslist" ]; then
-    fail "ABORT kind: cannot list namespaces on kind-$KIND_CLUSTER. kubectl said:"; sed 's/^/    /' "$ERR_DIR/kind-ns.err" | head -3 >&2; return 1
+    fail "kind gate REFUSED: cannot list namespaces on kind-$KIND_CLUSTER. kubectl said:"; sed 's/^/    /' "$ERR_DIR/kind-ns.err" | head -3 >&2; return 1
   fi
   while IFS=$'\t' read -r ns lbl; do
     [ -n "$ns" ] || continue
     if ! perms=$("${kk[@]}" auth can-i --list -n "$ns" --as="$as" 2>/dev/null); then bad="$bad no-rule-list-for-$ns"; continue; fi
     case "$lbl" in
-      baseline|restricted) v=$( { printf '%s\n' "$perms" | rules_write_namespaces; printf '%s\n' "$perms" | rules_not_readonly | grep -F 'a shell or the kubelet'; } | head -1) ;;
+      baseline|restricted) v=$(printf '%s\n' "$perms" | rules_write_namespaces | head -1) ;;
       *) v=$(printf '%s\n' "$perms" | rules_not_readonly | head -1) ;;
     esac
     [ -z "$v" ] || bad="$bad $ns:[$v]"
@@ -302,7 +306,7 @@ kind_psa_gate() {
   plugins=$("${kk[@]}" -n kube-system get pod -l component=kube-apiserver -o jsonpath='{.items[*].spec.containers[*].command[*]}' 2>/dev/null | tr ' ' '\n' | sed -n 's/^--enable-admission-plugins=//p' | head -1) || plugins=""
   case ",$plugins," in *,DenyServiceExternalIPs,*) ;; *) warn "kind: the API server does not run the DenyServiceExternalIPs admission plugin (enabled: '${plugins:-?}'; a cluster created before it was added?) — recreate it when convenient: tools/kind-stack.sh $STACK down && tools/kind-stack.sh $STACK up" ;; esac
   case ",$plugins," in *,NodeRestriction,*) ;; *) bad="$bad no-NodeRestriction-admission(enabled:'${plugins:-?}')" ;; esac
-  [ -z "$bad" ] || { fail "ABORT kind: $KIND_SA could undo the Pod Security label or run workloads outside it:$bad"; return 1; }
+  [ -z "$bad" ] || { fail "kind gate REFUSED: $KIND_SA could undo the Pod Security label or run workloads outside it:$bad"; return 1; }
   ok "kind: namespace $KIND_NS enforces Pod Security '$psa'; $KIND_SA cannot change it"
 }
 
@@ -470,10 +474,10 @@ if [ -n "${DEV_KUBE_CONTEXT:-}" ] && [ -n "${DEV_KUBE_NS:-}" ] && [ -n "${DEV_KU
   # spot checks: any verb outside get/list/watch, any non-resource write, or any secrets access
   # (list/watch return secret data too) refuses the mint. Unparseable output also refuses.
   if ! perms=$(k auth can-i --list -n "$DEV_KUBE_NS" --as="$as" 2>"$ERR_DIR/dev-perms.err"); then
-    fail "ABORT dev: could not list $DEV_KUBE_SA permissions — dev credential NOT installed" >&2; sed 's/^/    /' "$ERR_DIR/dev-perms.err"; ok=0
+    fail "dev gate REFUSED: could not list $DEV_KUBE_SA permissions — dev credential NOT installed" >&2; sed 's/^/    /' "$ERR_DIR/dev-perms.err"; ok=0
   else
     bad=$(printf '%s\n' "$perms" | rules_not_readonly)
-    [ -z "$bad" ] || { fail "ABORT dev: $DEV_KUBE_SA is not read-only/secret-free; dev credential NOT installed:"; printf '%s\n' "$bad" | sed 's/^/    /' >&2; ok=0; }
+    [ -z "$bad" ] || { fail "dev gate REFUSED: $DEV_KUBE_SA is not read-only/secret-free; dev credential NOT installed:"; printf '%s\n' "$bad" | sed 's/^/    /' >&2; ok=0; }
   fi
   if [ $ok = 1 ]; then
     if tok=$(k -n "$DEV_KUBE_NS" create token "$DEV_KUBE_SA" --duration=8h 2>"$ERR_DIR/dev-mint.err" | tr -d '[:space:]') \
@@ -713,7 +717,10 @@ if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITLAB_HOST:-}" ]; then
       o=$(remote_repo "$gd" origin); u=$(remote_repo "$gd" upstream)
       case "$o" in
         "$_fork_org/"*) GITPROXY_WRITE="$GITPROXY_WRITE,github.com/$o" ;;
-        *) warn "git: $r's origin is ${o:-not on github.com}, not a fork in $FORK_ORG — not on the push list (tools/stack-fork.sh $STACK)" ;;
+        "") if GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git config --file "$gd/config" --get remote.origin.url >/dev/null 2>&1; then
+              warn "git: $r's origin is not on github.com — not on the push list (tools/stack-fork.sh $STACK wires forks)"
+            else info "git: $r has no origin — a local repo (a lab?), not on the push list"; fi ;;
+        *) warn "git: $r's origin is $o, not a fork in $FORK_ORG — not on the push list (tools/stack-fork.sh $STACK)" ;;
       esac
       case "$u" in
         "") ;;
@@ -824,15 +831,15 @@ if [ -n "${GH_PUBLIC_TOKEN:-}" ]; then
   # The token goes to curl through a config file (mode 600 in ERR_DIR), never on the host's argv.
   ( umask 077; printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\n' "$GH_PUBLIC_TOKEN" > "$ERR_DIR/gh-curl.cfg" )
   gh_api() { curl -sS --max-time 15 -K "$ERR_DIR/gh-curl.cfg" "https://api.github.com/$1" 2>>"$ERR_DIR/gh-public.err"; }
-  case "$GH_PUBLIC_TOKEN" in github_pat_*) ;; *) fail "ABORT gh: GH_PUBLIC_TOKEN is not a fine-grained token (github_pat_…) — NOT installed"; GH_PUBLIC_TOKEN=unverifiable ;; esac
+  case "$GH_PUBLIC_TOKEN" in github_pat_*) ;; *) fail "gh gate REFUSED: GH_PUBLIC_TOKEN is not a fine-grained token (github_pat_…) — NOT installed"; GH_PUBLIC_TOKEN=unverifiable ;; esac
   if [ "$GH_PUBLIC_TOKEN" != unverifiable ]; then
     # Any failure (network, non-JSON) leaves the variables empty / "?" and refuses: fail closed, not out.
     login=$(gh_api user | jq -r '.login // empty' 2>/dev/null) || login=""
     private=$(gh_api 'user/repos?visibility=private&per_page=1' | jq -r 'if type == "array" then length else "?" end' 2>/dev/null) || private="?"
     if [ -z "$login" ]; then
-      fail "ABORT gh: GH_PUBLIC_TOKEN is not valid or api.github.com is unreachable (GET /user failed) — NOT installed" >&2; sed 's/^/    /' "$ERR_DIR/gh-public.err"
+      fail "gh gate REFUSED: GH_PUBLIC_TOKEN is not valid or api.github.com is unreachable (GET /user failed) — NOT installed" >&2; sed 's/^/    /' "$ERR_DIR/gh-public.err"
     elif [ "$private" != 0 ]; then
-      fail "ABORT gh: GH_PUBLIC_TOKEN can see private repositories (or the probe failed: '$private') — NOT installed"
+      fail "gh gate REFUSED: GH_PUBLIC_TOKEN can see private repositories (or the probe failed: '$private') — NOT installed"
     else
       GH_TOKEN="$GH_PUBLIC_TOKEN"
       ok "gh: public-read-only token for $login enters the jail (authenticated rate limit; writes are refused by GitHub)"
