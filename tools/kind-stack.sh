@@ -186,9 +186,8 @@ nodes:
   - |
     kind: ClusterConfiguration
     apiServer:
-      extraArgs:                                  # v1beta4 list form (kind ≥0.26 with k8s ≥1.31); NodeRestriction is kubeadm's default and must be kept
-      - name: enable-admission-plugins
-        value: NodeRestriction,DenyServiceExternalIPs
+      extraArgs:                                  # kubeadm v1beta3 map form (what kind 0.29 generates; v1beta4 would take a list)
+        enable-admission-plugins: NodeRestriction,DenyServiceExternalIPs   # NodeRestriction is kubeadm's default: this key replaces it, so it is kept
 EOT
       if [ -n "$KIND_HTTP_PORT" ]; then
         cat <<EOT
