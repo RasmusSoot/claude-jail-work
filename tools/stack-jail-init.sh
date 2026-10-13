@@ -78,7 +78,7 @@ fi
 if [ -n "${STACK_ARGO_TOKEN:-}" ]; then
   # The argocd CLI reads these three; the token is the stack's own Argo account, get+sync only, 8h.
   export ARGOCD_SERVER="$STACK_ARGO_SERVER" ARGOCD_AUTH_TOKEN="$STACK_ARGO_TOKEN" ARGOCD_OPTS="--insecure"
-  _sj_argo="\`argocd app get|sync|wait|logs|diff <app>\` on this stack's Applications (project \`${STACK_NAME:-stack}\`, server \`$STACK_ARGO_SERVER\`, 8h token in \`ARGOCD_AUTH_TOKEN\`; \`argocd\` itself comes from the repo's devbox). The account can get and sync, nothing else: creating, editing or deleting an Application, a repo or an account is refused by the API. Applications pull the chart version the sidecar pushed; auto-sync + self-heal is on, so a hand edit in the namespace is reverted — change the chart and push instead."
+  _sj_argo="\`argocd app get|sync|wait|logs|diff <app>\` on this stack's Applications (project \`${STACK_NAME:-stack}\`, server \`$STACK_ARGO_SERVER\`, 8h token in \`ARGOCD_AUTH_TOKEN\`, the account disabled at session end; \`argocd\` itself comes from the repo's devbox). The account can get and sync, nothing else: creating, editing or deleting an Application, a repo or an account is refused by the API. Applications pull the chart version the sidecar pushed; auto-sync + self-heal is on, so a hand edit in the namespace is reverted — change the chart and push instead."
 else
   _sj_argo="no Argo CD token this session — \`argocd\` is unavailable (the stack has no ARGO_APPS, or the launcher's gate refused)."
 fi

@@ -2,6 +2,7 @@
 # stack-jail — host-side launcher for a per-stack jail (the credential airlock).
 #
 #   stack-jail.sh <stack> [--login]
+#   stack-jail.sh <stack> --adopt [<dir>/.git …]   record gitdirs the human made on the host (see "Terms" below)
 #
 # One jail per stack (a client's project, e.g. SiVa). What a stack IS comes from two files:
 #   stacks/<stack>.conf          committed, generic: repos, primary dir, kind cluster, upload port,
@@ -45,14 +46,21 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"           # this repo (the mechanism)
 JAIL_HOME="${JAIL_HOME:-$HOME/claude/jail}"         # per-stack workspaces live here
 STACK="${1:-}"; shift || true
 LOGIN=0; [ "${1:-}" = "--login" ] && LOGIN=1
-[ -n "$STACK" ] || { echo "usage: stack-jail.sh <stack> [--login]" >&2; exit 2; }
+ADOPT=0; ADOPT_PATHS=(); if [ "${1:-}" = "--adopt" ]; then ADOPT=1; shift; ADOPT_PATHS=("$@"); fi   # record named gitdirs, then exit
+[ -n "$STACK" ] || { echo "usage: stack-jail.sh <stack> [--login | --adopt [<dir>/.git …]]" >&2; exit 2; }
 
 CONF="$HERE/stacks/$STACK.conf"
 [ -f "$CONF" ] || { fail "FATAL: $CONF missing — add a stacks/<stack>.conf (see stacks/siva.conf)"; exit 2; }
 # shellcheck source=/dev/null
 . "$CONF"
 : "${REPOS:?stacks/$STACK.conf must set REPOS}" "${PRIMARY:?must set PRIMARY}" "${UPLOAD_PORT:?must set UPLOAD_PORT}"
-for r in $REPOS; do case "$r" in notes|build) fail "FATAL: stacks/$STACK.conf lists a repo named '$r' — that name is the stack's $r dir"; exit 2;; esac; done
+for r in $REPOS; do case "$r" in notes|build|tools) fail "FATAL: stacks/$STACK.conf lists a repo named '$r' — /workspace/$r is the stack's $r mount"; exit 2;; esac; done
+for _c in "$HERE"/stacks/*.conf; do                 # a host port is one stack's: a clash would surface only at `docker run`, after the mints
+  [ "$_c" != "$CONF" ] || continue
+  _u=$(sed -n 's/^UPLOAD_PORT=\([0-9]*\).*/\1/p' "$_c" | head -1); _r=$(sed -n 's/^REGISTRY_PORT=\([0-9]*\).*/\1/p' "$_c" | head -1)
+  [ "$_u" != "$UPLOAD_PORT" ] || { fail "FATAL: UPLOAD_PORT=$UPLOAD_PORT is also $(basename "$_c")'s — give one of them another port"; exit 2; }
+  [ -z "${REGISTRY_PORT:-}" ] || [ "$_r" != "$REGISTRY_PORT" ] || { fail "FATAL: REGISTRY_PORT=$REGISTRY_PORT is also $(basename "$_c")'s — give one of them another port"; exit 2; }
+done; unset _c _u _r
 KIND_CLUSTER="${KIND_CLUSTER-$STACK}"               # conf may set KIND_CLUSTER="" = no kind for this stack
 KIND_NET="${KIND_NET:-kind}"                        # docker network the kind nodes sit on
 KIND_NS="${KIND_NS:-$STACK}"
@@ -62,6 +70,8 @@ ENV_FILE="$JAIL_HOME/.env.$STACK"
 STATE_DIR="$JAIL_HOME/.claude-data-$STACK"
 CLAUDE_JSON="$JAIL_HOME/.claude-data-$STACK.json"
 SHARED_CREDS="$JAIL_HOME/.claude-data/.credentials.json"   # login once via `jail-main`
+RUN_DIR="$JAIL_HOME/.run-$STACK"; mkdir -p "$RUN_DIR"; chmod 700 "$RUN_DIR"   # host-only, never mounted: sidecar audit logs, the gitdir record, the builder's work dirs
+GITDIR_RECORD="$RUN_DIR/gitdirs"                     # see "Terms" below
 
 mkdir -p "$STATE_DIR" "$JAIL_HOME/$STACK"
 [ -s "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
@@ -69,6 +79,81 @@ for r in $REPOS; do
   [ -d "$JAIL_HOME/$STACK/$r" ] || warn "$JAIL_HOME/$STACK/$r missing — run tools/stack-fork.sh $STACK first"
 done
 [ -d "$JAIL_HOME/$STACK/$PRIMARY" ] || { fail "FATAL: the primary dir $PRIMARY is missing — run tools/stack-fork.sh $STACK (or mkdir it, if it is a local-only dir)"; exit 2; }
+[ "$ADOPT" = 1 ] || jq -e 'length > 0' "$SHARED_CREDS" >/dev/null 2>&1 \
+  || { fail "FATAL: $SHARED_CREDS is missing or empty (setup-env.sh leaves a placeholder) — log in once via \`jail-main\` first (nothing is minted without it)"; exit 1; }
+
+# Terms. A REPO DIR is a REPOS entry, ~/claude/jail/<stack>/<name>, mounted rw at /workspace/<name>;
+# the conf decides that and it says nothing about git. A GITDIR is <repo dir>/.git as a directory —
+# the only kind there is here: a .git pointer file or symlink, or a .git/modules dir (submodules),
+# stops the launch (tools/gitdir-scan.sh says why). A RECORDED GITDIR is one listed with its inode
+# in $RUN_DIR/gitdirs — by tools/stack-fork.sh for the clones it makes, by this launcher for the
+# notes repo it creates, and by `--adopt <dir>/.git` for what the human made on the host and has
+# looked at — and only a recorded gitdir is mounted protected, has its remotes read for the push
+# list, and is not an audit hit. A LOCAL-ONLY DIR is a repo dir with no recorded gitdir, and it
+# stays one if a .git appears in it. A gitdir on disk that is not recorded, or whose inode differs
+# from the record, is a PLANTED GITDIR until the human says otherwise: it stops the launch here,
+# before any token is minted, and the exit audit reports it the same day. Against the jail the
+# record is exact: a repo dir and its gitdir are both mountpoints there, so a session can neither
+# rename nor replace them, and a gitdir absent at any launch is pruned from the record, so one a
+# session makes at that path later is unrecorded. The inode is for the host side: a directory
+# replaced by hand with no launch in between shows as "replaced" (unless the filesystem reused the
+# inode, which only the human's own re-clone can bring about: accepted). Trust comes from the
+# record, never from presence on disk: the jail writes the disk.
+gitdir_scan() { # → the scan's lines on stdout, or a non-zero exit: a scan that did not run to its "end" line is no scan
+  local out; out=$(mktemp) || return 1
+  # shellcheck disable=SC2086  # REPOS is a word list, split on purpose
+  if ! bash "$HERE/tools/gitdir-scan.sh" "$JAIL_HOME/$STACK" $REPOS notes build > "$out" 2>"$out.err" || [ "$(tail -n 1 "$out")" != end ]; then
+    fail "gitdir scan did not run (tools/gitdir-scan.sh): $(head -c 300 "$out.err" | tr '\n' ' ')"; rm -f "$out" "$out.err"; return 1
+  fi
+  sed '$d' "$out"; rm -f "$out" "$out.err"
+}
+# One actor per stack at a time: this launch, a `--adopt`, or tools/stack-fork.sh. The lock is a
+# directory (mkdir is atomic, POSIX, macOS too) held until exit; the holder check behind it is for
+# the session itself, which outlives the launcher's gates. Without both, a second launch would scan
+# a tree the first session is writing, and its cleanup would tear the first session's sidecars down.
+LOCK="$RUN_DIR/lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  fail "FATAL: $LOCK exists — another $STACK launch, --adopt or stack-fork.sh is running. If none is (a crashed one left it): rmdir $LOCK"; exit 2
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT                     # the later traps keep this
+session_running() { # the namespace holder, or the jail itself (it can outlive a killed launcher, with its rw mounts)
+  docker container inspect -f '{{.State.Running}}' "jail-$STACK-net" "jail-$STACK" 2>/dev/null | grep -q true
+}
+if session_running; then
+  fail "FATAL: a $STACK session is running (jail-$STACK or jail-$STACK-net): one at a time — the tree is being written while this would scan and mount it. If that session is gone and only its containers linger: docker rm -f jail-$STACK jail-$STACK-net"; exit 2
+fi
+record_prune "$GITDIR_RECORD" "$JAIL_HOME/$STACK"
+GITDIR_RELS=(); _unrec=""; _refuse=""; _adoptable=""
+_scan=$(gitdir_scan) || { fail "FATAL: no gitdir scan, no launch"; exit 2; }
+while IFS=$'\t' read -r _kind _p _x; do
+  case "$_kind" in
+    gitdir) if record_has "$GITDIR_RECORD" "$_p" "$_x"; then GITDIR_RELS+=("$_p")
+            elif record_line "$GITDIR_RECORD" "$_p"; then _unrec="$_unrec"$'\n'"    $(printf '%q' "$_p")  (recorded, but replaced since: a different directory)"; _adoptable="$_adoptable $(printf '%q' "$_p")"
+            else _unrec="$_unrec"$'\n'"    $(printf '%q' "$_p")  (not recorded)"; _adoptable="$_adoptable $(printf '%q' "$_p")"; fi ;;
+    refuse) _refuse="$_refuse"$'\n'"    $(printf '%q' "$_p"): $_x" ;;
+  esac
+done <<< "$_scan"
+if [ "$ADOPT" = 1 ]; then
+  [ -z "$_refuse" ] || { fail "FATAL: nothing can be adopted while these exist (remove or fix them first):$_refuse"; exit 2; }
+  if [ ${#ADOPT_PATHS[@]} -eq 0 ]; then
+    if [ -z "$_unrec" ]; then ok "git: every gitdir on disk is in $GITDIR_RECORD — nothing to adopt"; exit 0; fi
+    fail "--adopt takes the gitdirs to record, by name, after you have looked at each one's config and hooks (nothing has run them). Candidates:$_unrec"
+    printf '    tools/stack-jail.sh %s --adopt%s\n' "$STACK" "$_adoptable" >&2; exit 2
+  fi
+  for _p in "${ADOPT_PATHS[@]}"; do
+    _p="${_p%/}"; _p="${_p#./}"
+    _x=$(printf '%s\n' "$_scan" | awk -F'\t' -v p="$_p" '$1 == "gitdir" && $2 == p { print $3 }')
+    [ -n "$_x" ] || { fail "FATAL: $(printf '%q' "$_p") is not a top-level .git directory of a listed dir (candidates:$_unrec)"; exit 2; }
+    record_add "$GITDIR_RECORD" "$_p" "$_x" && ok "git: recorded $(printf '%q' "$_p") (inode $_x) in $GITDIR_RECORD — its config, hooks and commondir are read-only in the jail from the next launch"
+  done
+  exit 0
+fi
+[ -z "$_refuse" ] || { fail "FATAL: git state the jail must not see (tools/gitdir-scan.sh) — made by a session, or by hand? Inspect, then remove or fix it:$_refuse"; exit 2; }
+if [ -n "$_unrec" ]; then
+  fail "FATAL: gitdirs on disk that are not in $GITDIR_RECORD — new on the host (git init, a clone by hand), or planted by a session? Inspect each one's config and hooks (nothing has run them), then record what is yours:$_unrec"
+  printf '    tools/stack-jail.sh %s --adopt%s\n' "$STACK" "$_adoptable" >&2; exit 2
+fi
+unset _unrec _refuse _adoptable _kind _p _x _scan
 # READ-ONLY views of other stacks: "<stack>:<repo>" pairs, resolved from each stack's own conf.
 READ_PAIRS=""
 for rs in ${READS:-}; do
@@ -96,7 +181,7 @@ set +a
 # since rules contain spaces; "" = none). This is the jail's own ~/.claude/settings.json, which the
 # jail could edit anyway.
 JAIL_ALLOW="${JAIL_ALLOW-Bash(*), Edit(*), Write(*), Read(*), NotebookEdit(*), WebFetch(domain:*), WebSearch}"
-JAIL_ALLOW="$JAIL_ALLOW" python3 - "$JAIL_HOME/.claude-data/settings.json" "$STATE_DIR/settings.json" <<'PY'
+JAIL_ALLOW="$JAIL_ALLOW" python3 -I - "$JAIL_HOME/.claude-data/settings.json" "$STATE_DIR/settings.json" <<'PY'
 import json, os, sys
 src, dst = sys.argv[1], sys.argv[2]
 allow = [r.strip() for r in os.environ.get("JAIL_ALLOW", "").split(",") if r.strip()]
@@ -110,7 +195,7 @@ PY
 ok "permissions: allow = ${JAIL_ALLOW:-<none>} (per-stack settings; managed deny and ask rules still win)"
 TRUST_DIRS=""; for r in $REPOS; do TRUST_DIRS="$TRUST_DIRS /workspace/$r"; done
 # shellcheck disable=SC2086  # TRUST_DIRS is a space-separated list: one argv entry per dir
-python3 - "$CLAUDE_JSON" "$JAIL_HOME/.claude-data.json" $TRUST_DIRS <<'PY'
+python3 -I - "$CLAUDE_JSON" "$JAIL_HOME/.claude-data.json" $TRUST_DIRS <<'PY'
 import json, os, sys
 target, main_path, dirs = sys.argv[1], sys.argv[2], sys.argv[3:]
 d = json.load(open(target)); main = json.load(open(main_path)) if os.path.exists(main_path) else {}
@@ -123,8 +208,8 @@ json.dump(d, open(target, "w"), indent=2)
 PY
 
 # shellcheck disable=SC2329  # invoked by the trap string; redefined once a token exists
-argo_revoke() { :; }
-ERR_DIR=$(mktemp -d); trap 'argo_revoke; rm -rf "$ERR_DIR"' EXIT   # mint stderr; no fixed /tmp names (cleanup() takes over later)
+argo_revoke() { :; }; ARGO_DISABLED=0
+ERR_DIR=$(mktemp -d); trap 'argo_revoke || true; rm -rf "$ERR_DIR"; rmdir "$LOCK" 2>/dev/null' EXIT   # mint stderr; no fixed /tmp names (cleanup() takes over later)
 # ── token gates shared by both mints ────────────────────────────────────────────────────────────
 is_jwt()  { printf '%s' "$1" | grep -qE '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; }
 gitdir_id() { # <gitdir> → inode of the dir, inode + checksum of its config: "replaced" shows up as a change (ls -di and cksum: POSIX, macOS too)
@@ -145,6 +230,28 @@ jwt_sub() { # decode the JWT payload locally (base64url + padding) and print .su
 # namespaces (a fresh one would have no label), no creating pods anywhere else. The label, the SA
 # and its RoleBinding are applied by tools/kind-stack.sh <stack> up (host-side, from the conf):
 #   pod-security.kubernetes.io/enforce: baseline     # or restricted
+rules_not_readonly() { # stdin: `kubectl auth can-i --list` output → every row allowing more than get/list/watch, or any secrets read
+  # Rows: "<resource> [<non-resource URLs>] [<resource names>] [<verbs>]"; non-resource rows have
+  # no resource column. Verbs = the LAST bracket group (it may contain spaces).
+  awk '
+    NR == 1 || NF == 0 { next }                                # header
+    !match($0, /\[[^][]*\]$/) { print "unparseable: " $0; next }
+    { verbs = substr($0, RSTART + 1, RLENGTH - 2); res = ($1 ~ /^\[/) ? "(non-resource) " $1 : $1 }
+    # SelfSubject*Review creates are what can-i itself uses; they are not writes.
+    res ~ /^selfsubject(access|rules)?reviews\.(authorization|authentication)\.k8s\.io$/ && verbs == "create" { next }
+    res ~ /\/(proxy|exec|attach|portforward|ephemeralcontainers)$/ { print res " [" verbs "] (a shell or the kubelet, whatever the verb)"; next }
+    { n = split(verbs, v, " "); for (i = 1; i <= n; i++) if (v[i] !~ /^(get|list|watch)$/) { print res " [" verbs "]"; next } }
+    res ~ /^(\*|\*\.\*|secrets(\..*)?)$/ { print res " [" verbs "] (covers secrets)" }   # any read of secrets leaks them
+  '
+}
+rules_write_namespaces() { # stdin: the same → rows that let the subject patch/update/delete namespaces (the Pod Security label)
+  awk '
+    NR == 1 || NF == 0 { next }
+    !match($0, /\[[^][]*\]$/) { print "unparseable: " $0; next }
+    { verbs = substr($0, RSTART + 1, RLENGTH - 2) }
+    $1 ~ /^(namespaces|\*|\*\.\*)$/ && verbs ~ /(^| )(patch|update|delete|\*)( |$)/ { print $1 " [" verbs "]" }
+  '
+}
 kind_psa_gate() {
   local kk=(kubectl --context "kind-$KIND_CLUSTER") as="system:serviceaccount:$KIND_NS:$KIND_SA" psa bad=""
   # A failed read is not "label unset": the API may be down or the namespace missing. Say which.
@@ -163,14 +270,39 @@ kind_psa_gate() {
     [ "$("${kk[@]}" auth can-i "$v" "namespace/$KIND_NS" -n "$KIND_NS" --as="$as" 2>/dev/null)" = no ] || bad="$bad $v-namespace/$KIND_NS"
   done
   [ "$("${kk[@]}" auth can-i create namespaces --as="$as" 2>/dev/null)" = no ] || bad="$bad create-namespaces"
-  # Pods in any namespace without a Pod Security label, one namespace at a time: --all-namespaces
-  # answers "no" as soon as a single namespace is out of reach, which hides a grant in `default`.
-  local ns lbl
+  # Every namespace, one at a time (--all-namespaces answers "no" as soon as a single namespace is
+  # out of reach, which hides a grant in `default`), from the SA's whole rule list there: WITHOUT a
+  # Pod Security label it must be read-only and secret-free (not just "no create pods": a
+  # Deployment, Job, pods/exec or an ephemeral container runs a privileged container just as well);
+  # WITH one, nothing may patch/update/delete namespaces (that is the label), and the shell and
+  # kubelet subresources are refused there too (a cluster-wide nodes/proxy grant shows in every
+  # namespace's list, and kubelet exec bypasses Pod Security). A namespace list that fails or comes
+  # back empty refuses too: no list, no gate.
+  local ns lbl nslist perms v
+  if ! nslist=$("${kk[@]}" get ns -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.pod-security\.kubernetes\.io/enforce}{"\n"}{end}' 2>"$ERR_DIR/kind-ns.err") || [ -z "$nslist" ]; then
+    fail "ABORT kind: cannot list namespaces on kind-$KIND_CLUSTER. kubectl said:"; sed 's/^/    /' "$ERR_DIR/kind-ns.err" | head -3 >&2; return 1
+  fi
   while IFS=$'\t' read -r ns lbl; do
-    case "$lbl" in baseline|restricted) continue ;; esac
-    [ "$("${kk[@]}" auth can-i create pods -n "$ns" --as="$as" 2>/dev/null)" = no ] || bad="$bad create-pods-in-$ns"
-  done < <("${kk[@]}" get ns -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.pod-security\.kubernetes\.io/enforce}{"\n"}{end}' 2>/dev/null)
-  [ -z "$bad" ] || { fail "ABORT kind: $KIND_SA could undo the Pod Security label:$bad"; return 1; }
+    [ -n "$ns" ] || continue
+    if ! perms=$("${kk[@]}" auth can-i --list -n "$ns" --as="$as" 2>/dev/null); then bad="$bad no-rule-list-for-$ns"; continue; fi
+    case "$lbl" in
+      baseline|restricted) v=$( { printf '%s\n' "$perms" | rules_write_namespaces; printf '%s\n' "$perms" | rules_not_readonly | grep -F 'a shell or the kubelet'; } | head -1) ;;
+      *) v=$(printf '%s\n' "$perms" | rules_not_readonly | head -1) ;;
+    esac
+    [ -z "$v" ] || bad="$bad $ns:[$v]"
+  done <<< "$nslist"
+  # A Service with externalIPs makes kube-proxy route traffic for that address — the node's own, say —
+  # to a pod of the SA's choosing, ahead of the NodePort (the CVE-2020-8554 pattern). The admin login
+  # above verifies TLS, so a capture gets nothing, but none may exist, and the cluster should refuse
+  # them outright (DenyServiceExternalIPs, set by tools/kind-stack.sh at create time).
+  local ext
+  ext=$("${kk[@]}" get svc -A -o jsonpath='{range .items[?(@.spec.externalIPs)]}{.metadata.namespace}/{.metadata.name}{" "}{end}' 2>/dev/null) || ext="?"
+  [ -z "$ext" ] || bad="$bad services-with-externalIPs:[${ext% }]"
+  local plugins
+  plugins=$("${kk[@]}" -n kube-system get pod -l component=kube-apiserver -o jsonpath='{.items[*].spec.containers[*].command[*]}' 2>/dev/null | tr ' ' '\n' | sed -n 's/^--enable-admission-plugins=//p' | head -1) || plugins=""
+  case ",$plugins," in *,DenyServiceExternalIPs,*) ;; *) warn "kind: the API server does not run the DenyServiceExternalIPs admission plugin (enabled: '${plugins:-?}'; a cluster created before it was added?) — recreate it when convenient: tools/kind-stack.sh $STACK down && tools/kind-stack.sh $STACK up" ;; esac
+  case ",$plugins," in *,NodeRestriction,*) ;; *) bad="$bad no-NodeRestriction-admission(enabled:'${plugins:-?}')" ;; esac
+  [ -z "$bad" ] || { fail "ABORT kind: $KIND_SA could undo the Pod Security label or run workloads outside it:$bad"; return 1; }
   ok "kind: namespace $KIND_NS enforces Pod Security '$psa'; $KIND_SA cannot change it"
 }
 
@@ -207,43 +339,84 @@ fi
 # sync and logs on the stack's project. The launcher logs in as admin over the API server's NodePort
 # on the kind network (that admin password is the disposable kind cluster's), mints a token with an
 # id of its own, checks shape and subject, then asks the API *as that token* what it may do: every
-# write it must not have (app create/update/delete/override, account update = minting more tokens,
+# write it must not have (app create/update/delete/override, update of any account — its own tokens an account may always mint, which the disable-at-exit covers,
 # repository create, project update) has to answer "no" and sync "yes". Deleted again at session end.
 STACK_ARGO_SERVER="" STACK_ARGO_TOKEN="" ARGO_TOKEN_ID="" ARGO_URL=""
 ARGO_ACCOUNT="$STACK-jail"; ARGO_NODEPORT="${ARGO_NODEPORT:-30443}"
-argo_api() { curl -sSk --max-time 15 -K "$ERR_DIR/argo-$1.cfg" -H 'Content-Type: application/json' "${@:2}" 2>>"$ERR_DIR/argo.err"; }
-argo_revoke() {
-  [ -n "${ARGO_TOKEN_ID:-}" ] && [ -f "${ERR_DIR:-/nonexistent}/argo-admin.cfg" ] || return 0
-  if argo_api admin -X DELETE "$ARGO_URL/api/v1/account/$ARGO_ACCOUNT/token/$ARGO_TOKEN_ID" >/dev/null; then
-    ok "argocd: token $ARGO_TOKEN_ID deleted"
+# TLS is VERIFIED here, unlike the jail's own argocd calls: the admin password goes over this connection.
+# The trust anchor is the server's certificate read through the API server (whose TLS the host
+# kubeconfig verifies), and --resolve pins the name in that certificate to the node's address, so a
+# Service with externalIPs (which a namespace admin may create, and kube-proxy honours before the
+# NodePort) that captured the connection could not answer with a certificate curl accepts.
+argo_api() { curl -sS --fail-with-body --max-time 15 --cacert "$ERR_DIR/argo-ca.pem" --resolve "$ARGO_RESOLVE" -K "$ERR_DIR/argo-$1.cfg" -H 'Content-Type: application/json' "${@:2}" 2>>"$ERR_DIR/argo.err"; }
+argo_account_enabled() { # <true|false>: a disabled local account's tokens are all refused at once — the kill switch
+  kubectl --context "kind-$KIND_CLUSTER" -n argocd patch cm argocd-cm --type merge -p "{\"data\":{\"accounts.$ARGO_ACCOUNT.enabled\":\"$1\"}}" >/dev/null 2>>"$ERR_DIR/argo.err"
+}
+argo_admin_login() { # → $ERR_DIR/argo-admin.cfg holds a fresh admin session; 1 if Argo is not reachable, its certificate is not readable, or the login fails
+  local node_ip admin_pw sess crt
+  node_ip=$(docker container inspect -f "{{with index .NetworkSettings.Networks \"$KIND_NET\"}}{{.IPAddress}}{{end}}" "$KIND_CLUSTER-control-plane" 2>/dev/null) || node_ip=""
+  admin_pw=$(kubectl --context "kind-$KIND_CLUSTER" -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>"$ERR_DIR/argo.err" | base64 -d) || admin_pw=""
+  # The server's certificate: a human-provided one (argocd-server-tls) or the self-signed one Argo keeps in argocd-secret
+  crt=$(kubectl --context "kind-$KIND_CLUSTER" -n argocd get secret argocd-server-tls -o jsonpath='{.data.tls\.crt}' 2>/dev/null) || crt=""
+  [ -n "$crt" ] || crt=$(kubectl --context "kind-$KIND_CLUSTER" -n argocd get secret argocd-secret -o jsonpath='{.data.tls\.crt}' 2>>"$ERR_DIR/argo.err") || crt=""
+  [ -n "$node_ip" ] && [ -n "$admin_pw" ] && [ -n "$crt" ] || { echo "no node address, admin password or server certificate" >> "$ERR_DIR/argo.err"; return 1; }
+  ( umask 077; printf '%s' "$crt" | base64 -d > "$ERR_DIR/argo-ca.pem" )
+  ARGO_URL="https://argocd-server:$ARGO_NODEPORT"; ARGO_RESOLVE="argocd-server:$ARGO_NODEPORT:$node_ip"   # the name is in Argo's self-signed certificate
+  ( umask 077; : > "$ERR_DIR/argo-none.cfg" )                   # the password travels on stdin (to jq, then to curl), never argv
+  sess=$(printf '%s' "$admin_pw" | jq -n --rawfile p /dev/stdin '{username:"admin",password:$p}' | argo_api none -X POST "$ARGO_URL/api/v1/session" -d @- | jq -r '.token // empty' 2>/dev/null) || sess=""
+  [ -n "$sess" ] || return 1
+  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$sess" > "$ERR_DIR/argo-admin.cfg" )
+}
+argo_revoke() { # [keep]: EVERY token of the stack's account, not just this launch's — Argo CD lets an account manage its
+                # own tokens, so a session could mint itself a longer one; it dies here, at launch and at session end.
+                # Loud when it cannot: a silent failure would look like "no tokens". At exit the admin session from the
+                # launch may have expired (24h), so it logs in again unless told to keep the one it has.
+  [ -n "${ARGO_URL:-}" ] && [ -d "${ERR_DIR:-/nonexistent}" ] || return 0          # Argo was never reached this launch
+  local acct ids id n=0 all=0 rc=0 by_hand="delete them by hand: tools/kind-stack.sh $STACK ui → Settings → Accounts → $ARGO_ACCOUNT (the next launch deletes them too)"
+  # The kill switch first, through the API server: a disabled account's tokens are refused at once,
+  # every one of them — including one a pod mints after the list below is read (the list is a
+  # snapshot; disabling is not). The account stays disabled until the next launch re-enables it.
+  if argo_account_enabled false; then
+    ARGO_DISABLED=1; if [ "${1:-}" = keep ]; then ok "argocd: account $ARGO_ACCOUNT disabled while its tokens are cleared"; else ok "argocd: account $ARGO_ACCOUNT disabled until the next launch"; fi
+  else ARGO_DISABLED=0; warn "argocd: could not disable account $ARGO_ACCOUNT (argocd-cm) — its tokens stay valid until deleted; $by_hand"; rc=1; fi
+  if [ "${1:-}" != keep ] && ! argo_admin_login; then
+    warn "argocd: cannot log in at $ARGO_URL as admin — the tokens of $ARGO_ACCOUNT were NOT deleted; $by_hand"; ARGO_TOKEN_ID=""; return 1
+  fi
+  acct=$(argo_api admin "$ARGO_URL/api/v1/account/$ARGO_ACCOUNT") || acct=""
+  if [ "$(printf '%s' "$acct" | jq -r '.name // empty' 2>/dev/null)" != "$ARGO_ACCOUNT" ]; then
+    warn "argocd: could not read account $ARGO_ACCOUNT (tokens NOT deleted; $by_hand). It said: $(printf '%s' "$acct" | head -c 200)"; ARGO_TOKEN_ID=""; return 1
+  fi
+  ids=$(printf '%s' "$acct" | jq -r '.tokens[]?.id | @uri' 2>/dev/null) || ids=""
+  for id in $ids; do all=$((all + 1)); argo_api admin -X DELETE "$ARGO_URL/api/v1/account/$ARGO_ACCOUNT/token/$id" >/dev/null && n=$((n + 1)); done   # --fail-with-body: a 404 or 5xx does not count
+  # What counts is what the account says afterwards, not the DELETE tally: a token whose id the
+  # route cannot address (a session may choose the id) would otherwise be "deleted" and come back
+  # alive when the launch re-enables the account.
+  local left
+  left=$(argo_api admin "$ARGO_URL/api/v1/account/$ARGO_ACCOUNT" | jq -r 'select(.name == $a) | .tokens | length' --arg a "$ARGO_ACCOUNT" 2>/dev/null) || left=""
+  if [ "$left" = 0 ]; then
+    [ "$all" = 0 ] || ok "argocd: $n token(s) of $ARGO_ACCOUNT deleted${ARGO_TOKEN_ID:+ (the session token and any minted during the session)}"
   else
-    warn "argocd: could not delete token $ARGO_TOKEN_ID (it expires on its own)"
+    warn "argocd: ${left:-?} token(s) of $ARGO_ACCOUNT remain after deleting $n of $all — $by_hand"; rc=1
   fi
   ARGO_TOKEN_ID=""
+  return $rc
 }
 if [ -z "${ARGO_APPS:-}" ]; then
   info "argocd: no ARGO_APPS in stacks/$STACK.conf — argocd unavailable this session"
 elif [ -z "$STACK_KUBE_TOKEN" ]; then
   warn "argocd: skipped — no kind token this session"
 else
-  node_ip=$(docker container inspect -f "{{with index .NetworkSettings.Networks \"$KIND_NET\"}}{{.IPAddress}}{{end}}" "$KIND_CLUSTER-control-plane" 2>/dev/null) || node_ip=""
-  admin_pw=$(kubectl --context "kind-$KIND_CLUSTER" -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>"$ERR_DIR/argo.err" | base64 -d) || admin_pw=""
-  if [ -z "$node_ip" ] || [ -z "$admin_pw" ]; then
-    warn "argocd: not installed on kind-$KIND_CLUSTER, or the control-plane has no address on '$KIND_NET' (tools/kind-stack.sh $STACK up) — continuing without argocd"
+  if ! argo_admin_login; then
+    warn "argocd: not installed on kind-$KIND_CLUSTER, not reachable on '$KIND_NET', or the admin login failed (tools/kind-stack.sh $STACK up) — continuing without argocd. It said:"; tail -3 "$ERR_DIR/argo.err" | sed 's/^/    /' >&2
+    ARGO_URL=""                                                  # nothing to revoke at exit either
   else
-    ARGO_URL="https://$node_ip:$ARGO_NODEPORT"
-    ( umask 077; : > "$ERR_DIR/argo-none.cfg" )                 # the password travels on stdin, never argv
-    sess=$(jq -n --arg p "$admin_pw" '{username:"admin",password:$p}' | argo_api none -X POST "$ARGO_URL/api/v1/session" -d @- | jq -r '.token // empty' 2>/dev/null) || sess=""
-    unset admin_pw
-    if [ -z "$sess" ]; then
-      warn "argocd: admin login at $ARGO_URL failed — continuing without argocd. It said:"; tail -3 "$ERR_DIR/argo.err" | sed 's/^/    /' >&2
+    # Disable → delete every token → enable → mint. A launch that cannot clear the account does
+    # not mint: an old token would stay alive next to the new one.
+    if ! argo_revoke keep; then
+      warn "argocd: the account's tokens could not be cleared — continuing without argocd ($([ "${ARGO_DISABLED:-0}" = 1 ] && echo "the account stays disabled" || echo "and the account could NOT be disabled: delete its tokens by hand, tools/kind-stack.sh $STACK ui"))"
+    elif ! argo_account_enabled true; then
+      warn "argocd: could not re-enable account $ARGO_ACCOUNT (argocd-cm) — continuing without argocd"
     else
-      ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$sess" > "$ERR_DIR/argo-admin.cfg" ); unset sess
-      # Tokens of earlier launches that expired without a delete (a crash skips argo_revoke) go first.
-      for old in $(argo_api admin "$ARGO_URL/api/v1/account/$ARGO_ACCOUNT" \
-                   | jq -r --argjson now "$(date +%s)" '.tokens[]? | ((.expiresAt // 0) | tonumber) as $e | select($e > 0 and $e < $now) | .id' 2>/dev/null); do
-        argo_api admin -X DELETE "$ARGO_URL/api/v1/account/$ARGO_ACCOUNT/token/$old" >/dev/null || true
-      done
       ARGO_TOKEN_ID="jail-$(date +%Y%m%dT%H%M%S)"
       tok=$(jq -n --arg id "$ARGO_TOKEN_ID" '{expiresIn: 28800, id: $id}' \
             | argo_api admin -X POST "$ARGO_URL/api/v1/account/$ARGO_ACCOUNT/token" -d @- | jq -r '.token // empty' 2>/dev/null) || tok=""
@@ -251,15 +424,24 @@ else
         warn "argocd: could not mint a token for account $ARGO_ACCOUNT (tools/kind-stack.sh $STACK up creates it) — continuing without argocd. It said:"
         tail -3 "$ERR_DIR/argo.err" | sed 's/^/    /' >&2; ARGO_TOKEN_ID=""
       elif ! is_jwt "$tok" || [ "$(jwt_sub "$tok")" != "$ARGO_ACCOUNT:apiKey" ]; then
-        warn "argocd: minted token failed the shape/subject gate (sub='$(jwt_sub "$tok" 2>/dev/null)') — deleted, continuing without argocd"; argo_revoke
+        warn "argocd: minted token failed the shape/subject gate (sub='$(jwt_sub "$tok" 2>/dev/null)') — deleted, continuing without argocd"; argo_revoke keep || true
       else
         ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$tok" > "$ERR_DIR/argo-jail.cfg" )
         can_i() { argo_api jail "$ARGO_URL/api/v1/account/can-i/$1" | jq -r '.value // "?"' 2>/dev/null || echo "?"; }
         bad=""
+        # The whole RBAC ConfigMap first, from the host: its data must be exactly policy.csv as
+        # tools/kind-stack.sh renders it plus an empty policy.default — no overlay key (Argo merges
+        # every policy.*.csv), no matchMode or scopes — so a grant the probes below never ask about
+        # (actions, exec, projects, other accounts) cannot hide in a line or a key they do not cover.
+        _csv=$("$HERE/tools/kind-stack.sh" "$STACK" argo-policy 2>/dev/null) || _csv=""
+        _want=$(jq -nS --arg csv "$_csv" '{"policy.csv": $csv, "policy.default": ""}')
+        _have=$(kubectl --context "kind-$KIND_CLUSTER" -n argocd get cm argocd-rbac-cm -o json 2>/dev/null | jq -S '.data // {}') || _have="?"
+        { [ -n "$_csv" ] && [ "$_have" = "$_want" ]; } || bad="$bad argocd-rbac-cm-is-not-what-kind-stack.sh-renders"
+        unset _csv _want _have
         # The policy is glob-matched against the request object, so a grant on one app name
         # answers "no" to the wildcard probe: probe each name too, and the untouched default project.
         probes=("applications/create/$STACK/*" "applications/update/$STACK/*" "applications/delete/$STACK/*" "applications/override/$STACK/*" \
-                "applications/update/default/*" "applications/create/default/*" "accounts/update/$ARGO_ACCOUNT" "repositories/create/*" "projects/update/$STACK")
+                "applications/update/default/*" "applications/create/default/*" "accounts/update/$ARGO_ACCOUNT" "accounts/update/admin" "accounts/update/*" "repositories/create/*" "projects/update/$STACK")
         for _app in $ARGO_APPS; do probes+=("applications/update/$STACK/$_app" "applications/delete/$STACK/$_app" "applications/override/$STACK/$_app"); done
         for q in "${probes[@]}"; do
           [ "$(can_i "$q")" = no ] || bad="$bad $q"
@@ -268,7 +450,7 @@ else
         for _app in $ARGO_APPS; do [ "$(can_i "applications/sync/$STACK/$_app")" = yes ] || bad="$bad no-sync-$_app"; done
         rm -f "$ERR_DIR/argo-jail.cfg"
         if [ -n "$bad" ]; then
-          warn "argocd: account $ARGO_ACCOUNT is not get+sync-only (tools/kind-stack.sh $STACK up resets its policy):$bad — token deleted, NOT installed"; argo_revoke
+          warn "argocd: account $ARGO_ACCOUNT is not get+sync-only (tools/kind-stack.sh $STACK up resets its policy):$bad — token deleted, NOT installed"; argo_revoke keep || true
         else
           STACK_ARGO_TOKEN="$tok" STACK_ARGO_SERVER="$KIND_CLUSTER-control-plane:$ARGO_NODEPORT"
           ok "argocd: minted 8h token $ARGO_TOKEN_ID for $ARGO_ACCOUNT (get+sync on project $STACK; $STACK_ARGO_SERVER from the jail); deleted at session end"
@@ -290,17 +472,7 @@ if [ -n "${DEV_KUBE_CONTEXT:-}" ] && [ -n "${DEV_KUBE_NS:-}" ] && [ -n "${DEV_KU
   if ! perms=$(k auth can-i --list -n "$DEV_KUBE_NS" --as="$as" 2>"$ERR_DIR/dev-perms.err"); then
     fail "ABORT dev: could not list $DEV_KUBE_SA permissions — dev credential NOT installed" >&2; sed 's/^/    /' "$ERR_DIR/dev-perms.err"; ok=0
   else
-    # Rows: "<resource> [<non-resource URLs>] [<resource names>] [<verbs>]"; non-resource rows have
-    # no resource column. Verbs = the LAST bracket group (it may contain spaces).
-    bad=$(printf '%s\n' "$perms" | awk '
-      NR == 1 || NF == 0 { next }                                # header
-      !match($0, /\[[^][]*\]$/) { print "unparseable: " $0; next }
-      { verbs = substr($0, RSTART + 1, RLENGTH - 2); res = ($1 ~ /^\[/) ? "(non-resource) " $1 : $1 }
-      # SelfSubject*Review creates are what can-i itself uses; they are not writes.
-      res ~ /^selfsubject(access|rules)?reviews\.(authorization|authentication)\.k8s\.io$/ && verbs == "create" { next }
-      { n = split(verbs, v, " "); for (i = 1; i <= n; i++) if (v[i] !~ /^(get|list|watch)$/) { print res " [" verbs "]"; next } }
-      res ~ /^(\*|\*\.\*|secrets(\..*)?)$/ { print res " [" verbs "] (covers secrets)" }   # any read of secrets leaks them
-    ')
+    bad=$(printf '%s\n' "$perms" | rules_not_readonly)
     [ -z "$bad" ] || { fail "ABORT dev: $DEV_KUBE_SA is not read-only/secret-free; dev credential NOT installed:"; printf '%s\n' "$bad" | sed 's/^/    /' >&2; ok=0; }
   fi
   if [ $ok = 1 ]; then
@@ -323,7 +495,6 @@ export STACK_KUBE_TOKEN STACK_KUBE_SERVER STACK_KUBE_CA STACK_KUBE_NS="$KIND_NS"
 export STACK_ARGO_SERVER STACK_ARGO_TOKEN
 export STACK_DEVKUBE_NS="${DEV_KUBE_NS:-}" STACK_DEVKUBE_SA="${DEV_KUBE_SA:-}"   # the dev token itself never enters the jail
 
-[ -f "$SHARED_CREDS" ] || { warn "$SHARED_CREDS missing — log in once via \`jail-main\` first"; exit 1; }
 
 export STACK_NAME="$STACK" JAIL_NAME="$STACK" KIND_NET STACK_REPOS="$REPOS" UPLOAD_DIR="/workspace/notes/uploads" UPLOAD_HOST_PORT="$UPLOAD_PORT"
 # shellcheck disable=SC2086  # unquoted on purpose: echo squeezes the list's whitespace
@@ -360,71 +531,74 @@ if [ ! -d "$NOTES/.git" ]; then
   printf '/uploads/\n' > "$NOTES/.gitignore"
   printf '# %s notes\n\nShared with every %s jail session, never committed to any repo or published.\n' "$STACK" "$STACK" > "$NOTES/README.md"
   notes_git init -q && notes_snapshot "notes: start"
+  record_add "$GITDIR_RECORD" notes/.git "$(gitdir_inode "$NOTES/.git")"   # the launcher made it, on the host
+  GITDIR_RELS+=(notes/.git)
   ok "notes: created $NOTES (local git, no remote)"
 fi
 mkdir -p "$NOTES/uploads"
 notes_snapshot "before session $(date +%F\ %T)"
 VOLS+=(-v "$NOTES:/workspace/notes")
 
-# Git internals read-only (repo, every submodule under .git/modules, and notes): config, hooks and
+# Git internals read-only (each recorded gitdir: the repos' and notes'): config, hooks and
 # commondir all decide what HOST git runs the next time it — or an IDE sharing the working tree —
 # touches the repo (hooks, core.fsmonitor, core.sshCommand, filter drivers), and none shows up in a
 # diff. commondir is the subtle one: a gitdir may contain a file redirecting where config is read
 # from. A normal clone has none; "." means "this gitdir", which is the same thing — so the launcher
 # writes "." on the host and mounts it read-only, and the jail can neither create nor change it.
 # Costs: no repo-config writes in the jail (`push -u`, `remote add`, `branch --set-upstream-to`).
+# Only RECORDED gitdirs (see Terms above) get here: an unrecorded one stopped the launch.
 GITDIRS=(); GITDIR_IDS=()
-for r in $REPOS notes; do
-  gd="$JAIL_HOME/$STACK/$r/.git"
-  [ -d "$gd" ] || { [ -e "$gd" ] && warn "$r/.git is not a directory (worktree/submodule?) — git internals NOT protected"; continue; }
-  while IFS= read -r cfg; do
-    d="${cfg%/config}"; rel="${d#"$JAIL_HOME/$STACK/"}"
-    if [ -e "$d/commondir" ] && [ "$(cat "$d/commondir")" != "." ]; then
-      fail "FATAL: $d/commondir points to '$(cat "$d/commondir")' — not a normal clone, or tampered with. Inspect it before launching."; exit 2
-    fi
-    for f in "$d" "$cfg" "$d/hooks" "$d/commondir"; do      # a dangling symlink here would be written through, on the host
-      [ ! -L "$f" ] || { fail "FATAL: $f is a symlink — a gitdir the jail wrote? Inspect it before launching."; exit 2; }
-    done
-    printf '.\n' > "$d/commondir"
-    mkdir -p "$d/hooks"                                      # docker would create a missing source root-owned
-    # The gitdir itself is a mount, so it is a mountpoint: the jail cannot rename it away and put
-    # a gitdir with a config of its own in its place (renaming a directory that merely CONTAINS the
-    # three read-only mounts is allowed, and would have moved them along).
-    VOLS+=(-v "$d:/workspace/$rel" -v "$cfg:/workspace/$rel/config:ro" -v "$d/hooks:/workspace/$rel/hooks:ro" -v "$d/commondir:/workspace/$rel/commondir:ro")
-    GITDIRS+=("$d"); GITDIR_IDS+=("$(gitdir_id "$d")")
-  done < <(find "$gd" -maxdepth 1 -name config -type f; [ -d "$gd/modules" ] && find "$gd/modules" -name config -type f -path '*/modules/*/config')
+for rel in ${GITDIR_RELS[@]+"${GITDIR_RELS[@]}"}; do
+  d="$JAIL_HOME/$STACK/$rel"; cfg="$d/config"
+  if [ -e "$d/commondir" ] && [ "$(cat "$d/commondir")" != "." ]; then
+    fail "FATAL: $d/commondir points to '$(cat "$d/commondir")' — not a normal clone, or tampered with. Inspect it before launching."; exit 2
+  fi
+  for f in "$d" "$cfg" "$d/hooks" "$d/commondir"; do      # a dangling symlink here would be written through, on the host
+    [ ! -L "$f" ] || { fail "FATAL: $f is a symlink — a gitdir the jail wrote? Inspect it before launching."; exit 2; }
+  done
+  printf '.\n' > "$d/commondir"
+  mkdir -p "$d/hooks"                                      # docker would create a missing source root-owned
+  # The gitdir itself is a mount, so it is a mountpoint: the jail cannot rename it away and put
+  # a gitdir with a config of its own in its place (renaming a directory that merely CONTAINS the
+  # three read-only mounts is allowed, and would have moved them along).
+  VOLS+=(-v "$d:/workspace/$rel" -v "$cfg:/workspace/$rel/config:ro" -v "$d/hooks:/workspace/$rel/hooks:ro" -v "$d/commondir:/workspace/$rel/commondir:ro")
+  GITDIRS+=("$d"); GITDIR_IDS+=("$(gitdir_id "$d")")
 done
 
 # What mounts cannot cover, checked on the host at start and exit: a nested repository planted in
-# a working tree (IDEs auto-detect those and run git in them, with THEIR config), the files git
-# would only use for linked worktrees or per-worktree config, and a gitdir or config swapped for
-# another one (inode + checksum, recorded at launch). Warn loudly; deleting is the human's call.
+# a working tree, the build dir included (IDEs auto-detect those and run git in them, with THEIR
+# config), a gitdir that is not recorded, the files git would only use for linked worktrees or
+# per-worktree config, and a gitdir or config swapped for another one (inode + checksum, recorded
+# at launch). Warn loudly; deleting is the human's call.
 # Paths are printed quoted (%q): the jail picks the names, and an escape sequence in one would
 # otherwise truncate or erase the warning on the host terminal.
-own_submodule() { # <.git entry>: a .git FILE whose gitdir existed at launch (so its config and hooks are mounted read-only)
-  local target real g
-  [ -f "$1" ] || return 1
-  target=$(sed -n 's/^gitdir: //p' "$1"); [ -n "$target" ] || return 1
-  real=$(cd "$(dirname "$1")" && cd "$target" 2>/dev/null && pwd -P) || return 1
-  for g in ${GITDIRS[@]+"${GITDIRS[@]}"}; do [ "$(cd "$g" && pwd -P)" = "$real" ] && return 0; done
-  return 1                                                   # a gitdir made during the session is not a submodule of ours
-}
-audit_repos() { # <when>
-  local r d hits="" i=0
-  for r in $REPOS notes; do
-    [ -d "$JAIL_HOME/$STACK/$r/.git" ] || continue
-    while IFS= read -r d; do
-      own_submodule "$d" || hits="$hits"$'\n'"    nested repo: $(printf '%q' "$d")"
-    done < <(find "$JAIL_HOME/$STACK/$r" -mindepth 1 \( -path "$JAIL_HOME/$STACK/$r/.git" -prune \) -o \( -name .git -print -prune \) 2>/dev/null)
-  done
+mounted_gitdir() { local g; for g in ${GITDIR_RELS[@]+"${GITDIR_RELS[@]}"}; do [ "$g" = "$1" ] && return 0; done; return 1; }
+audit_repos() { # <when>: "before session" is fatal on anything the mounts do not cover; "after session" warns
+  local kind p x hits="" fatal="" i=0 d scan
+  if scan=$(gitdir_scan); then                              # the same scan as the launch check
+    while IFS=$'\t' read -r kind p x; do
+      case "$kind" in
+        gitdir) if ! record_has "$GITDIR_RECORD" "$p" "$x"; then hits="$hits"$'\n'"    gitdir not recorded, or replaced since (inspect, then --adopt): $(printf '%q' "$p")"; fatal=1
+                elif ! mounted_gitdir "$p"; then hits="$hits"$'\n'"    gitdir recorded after this launch's scan (a stack-fork.sh run?), so its config and hooks would NOT be read-only: $(printf '%q' "$p")"; fatal=1; fi ;;
+        refuse) hits="$hits"$'\n'"    $x: $(printf '%q' "$p")"; fatal=1 ;;
+        nested) hits="$hits"$'\n'"    nested repo: $(printf '%q' "$p")" ;;
+      esac
+    done <<< "$scan"
+  else
+    hits="$hits"$'\n'"    THE SCAN DID NOT RUN — nested repos and unrecorded gitdirs were not checked; fix tools/gitdir-scan.sh and launch again before touching the tree"; fatal=1
+  fi
   for d in ${GITDIRS[@]+"${GITDIRS[@]}"}; do                # bash 3.2 (macOS) + set -u: empty-array safe
     [ "$(cat "$d/commondir" 2>/dev/null)" = "." ] || hits="$hits"$'\n'"    commondir changed: $(printf '%q' "$d/commondir")"
+    for x in rebase-merge rebase-apply sequencer; do          # a todo left there runs its `exec` lines on the host at `--continue`
+      [ ! -e "$d/$x" ] || hits="$hits"$'\n'"    in-progress $x in $(printf '%q' "$d/") — inspect its todo before any --continue"
+    done
     [ ! -e "$d/config.worktree" ] || hits="$hits"$'\n'"    per-worktree config: $(printf '%q' "$d/config.worktree")"
     [ ! -d "$d/worktrees" ] || hits="$hits"$'\n'"    linked worktrees: $(printf '%q' "$d/worktrees/") (yours?)"
     [ "$(gitdir_id "$d")" = "${GITDIR_IDS[$i]}" ] || hits="$hits"$'\n'"    gitdir or its config replaced: $(printf '%q' "$d")"
     i=$((i + 1))
   done
   [ -z "$hits" ] || warn "git audit ($1) — do NOT run git or open these in an IDE until inspected:$hits"
+  if [ "$1" = "before session" ] && [ -n "$fatal" ]; then fail "FATAL: the tree changed between the scan and the mounts — launch again"; exit 2; fi
 }
 audit_repos "before session"
 for pr in $READ_PAIRS; do VOLS+=(-v "$JAIL_HOME/${pr%%:*}/${pr#*:}:/reads/${pr%%:*}/${pr#*:}:ro"); done
@@ -442,7 +616,6 @@ PORTS=(-p "127.0.0.1:$UPLOAD_PORT:8000")                       # loopback only �
 # live the same way in a gitproxy sidecar (127.0.0.1:8002): git smart-HTTP only, pushes only to
 # this stack's forks, whoever the client is.
 NETNS="jail-$STACK-net"; DEVPROXY="jail-$STACK-devproxy"; GITPROXY="jail-$STACK-gitproxy"; BUILDER="jail-$STACK-builder"; NET="jail-$STACK"
-RUN_DIR="$JAIL_HOME/.run-$STACK"; mkdir -p "$RUN_DIR"; chmod 700 "$RUN_DIR"   # sidecar audit logs
 PAUSE_IMAGE="${PAUSE_IMAGE:-registry.k8s.io/pause:3.10}"
 KUBECTL_IMAGE="${KUBECTL_IMAGE:-registry.k8s.io/kubectl:v1.37.1}"
 SIDECAR=(--read-only --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)")
@@ -454,10 +627,13 @@ cleanup() {
       docker logs "jail-$STACK-$c" > "$RUN_DIR/$c-$(date +%Y%m%dT%H%M%S).log" 2>&1 || true
     fi
   done
-  docker rm -f "$DEVPROXY" "$GITPROXY" "$BUILDER" "$NETNS" >/dev/null 2>&1 || true
+  docker rm -f "$DEVPROXY" "$GITPROXY" "$BUILDER" "$NETNS" "jail-$STACK" >/dev/null 2>&1 || true   # the jail is --rm, but a killed launcher leaves it
   rm -f "$RUN_DIR/dev-kubeconfig"
 }
-on_exit() { cleanup; argo_revoke; audit_repos "after session"; notes_snapshot "after session $(date +%F\ %T)"; rm -rf "$ERR_DIR"; }
+on_exit() { # every step guarded: errexit applies inside a trap, and a failed revoke must not skip the audit, the snapshot or the lock
+  cleanup || true; argo_revoke || true; audit_repos "after session" || true; notes_snapshot "after session $(date +%F\ %T)" || true
+  rm -rf "$ERR_DIR"; rmdir "$LOCK" 2>/dev/null || true
+}
 trap on_exit EXIT
 cleanup                                                           # leftovers of a crashed launch (ERR_DIR stays: the sidecar + gh gates below still write there)
 
@@ -522,17 +698,18 @@ export STACK_DEVKUBE_PROXY JAIL_NETNS="$NETNS"
 STACK_GITPROXY="" GITPROXY_WRITE="" GITPROXY_READ=""
 if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITLAB_HOST:-}" ]; then
   if [ -n "${GH_TOKEN:-}" ] && [ -n "${FORK_ORG:-}" ]; then
-    # From each clone's remotes as wired on the host by tools/stack-fork.sh, not from directory
-    # names: a local-only dir has no fork, and a same-named repo of another stack in the shared
-    # fork org must not land on this stack's lists. The config file is parsed with no system or
-    # global config; it is the one the launcher mounts read-only, so the jail never wrote it.
+    # From each RECORDED gitdir's remotes as wired on the host by tools/stack-fork.sh, not from
+    # directory names: a local-only dir has no fork (a .git the jail planted in one is unrecorded,
+    # and stopped the launch above), and a same-named repo of another stack in the shared fork org
+    # must not land on this stack's lists. The config file is parsed with no system or global
+    # config; it is the one the launcher mounts read-only, so the jail never wrote it.
     remote_repo() { # <gitdir> <remote> → owner/repo, lowercase, if the URL is on github.com; else nothing
       GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git config --file "$1/config" --get "remote.$2.url" 2>/dev/null \
         | sed -nE 's#^(https?://|git@|ssh://git@)github\.com[:/]##p' | sed -E 's#/+$##; s#\.git$##' | tr '[:upper:]' '[:lower:]' | grep -E '^[^/]+/[^/]+$' || true
     }
     _fork_org=$(printf '%s' "$FORK_ORG" | tr '[:upper:]' '[:lower:]'); _up_owner=$(printf '%s' "${UPSTREAM_OWNER:-}" | tr '[:upper:]' '[:lower:]')
     for r in $REPOS; do
-      gd="$JAIL_HOME/$STACK/$r/.git"; [ -d "$gd" ] || continue        # a local-only dir: nothing to push to
+      gd="$JAIL_HOME/$STACK/$r/.git"; record_line "$GITDIR_RECORD" "$r/.git" || continue  # a local-only dir: nothing to push to (an unrecorded gitdir stopped the launch)
       o=$(remote_repo "$gd" origin); u=$(remote_repo "$gd" upstream)
       case "$o" in
         "$_fork_org/"*) GITPROXY_WRITE="$GITPROXY_WRITE,github.com/$o" ;;
@@ -581,7 +758,8 @@ export STACK_GITPROXY GITPROXY_WRITE
 STACK_BUILD_DIR="" STACK_BUILD_REGISTRY="" STACK_BUILD_NAMES=""
 if [ -n "${BUILDER_IMAGE:-}" ]; then
   BUILD_NAMES="${BUILD_NAMES:-}"; BUILD_REGISTRY="${BUILD_REGISTRY:-jail-$STACK-registry:5000}"   # tools/kind-stack.sh's registry
-  BUILD_HOST_DIR="$JAIL_HOME/$STACK/build"; mkdir -p "$BUILD_HOST_DIR/.workspace" "$BUILD_HOST_DIR/.layers"   # pack's /workspace and /layers, see builder.sh
+  BUILD_HOST_DIR="$JAIL_HOME/$STACK/build"; mkdir -p "$BUILD_HOST_DIR"
+  BUILD_WORK_DIR="$RUN_DIR/builder"; mkdir -p "$BUILD_WORK_DIR/workspace" "$BUILD_WORK_DIR/layers"   # pack's /workspace and /layers (builder.sh): host-only, the jail sees neither
   # shellcheck disable=SC2086  # ${BUILDER_PULL:+--pull} below is one optional word
   if [ -z "$BUILD_NAMES" ]; then
     warn "build: BUILDER_IMAGE is set but BUILD_NAMES is empty in stacks/$STACK.conf — no sidecar (it could push nothing)"
@@ -600,7 +778,7 @@ if [ -n "${BUILDER_IMAGE:-}" ]; then
       [ -n "$BUILDER_PLATFORM_API" ] || warn "build: no platform API in the builder's labels (has: $(docker image inspect "$BUILDER" -f '{{range $k, $v := .Config.Labels}}{{$k}} {{end}}' 2>/dev/null)) — set BUILDER_PLATFORM_API in stacks/$STACK.conf"
     fi
     docker run -d --name "$BUILDER" --network "container:$NETNS" "${SIDECAR[@]}" --tmpfs /tmp -e HOME=/tmp \
-      -v "$BUILD_HOST_DIR:/build" -v "$BUILD_HOST_DIR/.workspace:/workspace" -v "$BUILD_HOST_DIR/.layers:/layers" \
+      -v "$BUILD_HOST_DIR:/build" -v "$BUILD_WORK_DIR/workspace:/workspace" -v "$BUILD_WORK_DIR/layers:/layers" \
       -e "BUILD_REGISTRY=$BUILD_REGISTRY" -e "BUILD_NAMES=$BUILD_NAMES" \
       -e "BUILDER_RUN_IMAGE=${BUILDER_RUN_IMAGE:-}" -e "BUILDER_PLATFORM_API=${BUILDER_PLATFORM_API:-}" -e REGISTRY_PUSH_USER -e REGISTRY_PUSH_PASSWORD "$BUILDER" >/dev/null
     for _ in $(seq 1 50); do
@@ -668,7 +846,7 @@ unset GH_PUBLIC_TOKEN
 export GH_TOKEN
 
 # Not exec: the EXIT trap has to remove the holder + sidecars (and save their logs) afterwards.
-docker compose -f "$HERE/docker-compose.yml" run --rm \
+docker compose -f "$HERE/docker-compose.yml" run --rm --name "jail-$STACK" \
   "${VOLS[@]}" \
   -e STACK_NAME -e JAIL_NAME -e JAIL_READS -e STACK_REPOS -e STACK_READS -e UPLOAD_DIR -e UPLOAD_HOST_PORT \
   -e STACK_GITPROXY -e GITPROXY_WRITE -e GITLAB_HOST -e GITLAB_FORK_PATH -e FORK_ORG -e GH_TOKEN \

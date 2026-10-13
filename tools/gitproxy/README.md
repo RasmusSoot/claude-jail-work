@@ -60,12 +60,17 @@ mapping, connection handling and that the log holds no token.
 
 Inside any jail (or on the host), against GitHub with no credential:
 
+The proxy picks the upstream from the `Host` header (`www.github.com` or `www.<GITLAB_HOST>`,
+which the launcher maps to loopback in the jail's namespace), so by hand the header is set
+explicitly and the path is just `<owner>/<repo>`:
+
 ```bash
-GITLAB_HOST=github.com GITPROXY_LISTEN=127.0.0.1:18002 GITPROXY_WRITE=github.com/octocat/Hello-World \
-  python3 tools/gitproxy/gitproxy.py &
-git clone http://127.0.0.1:18002/github.com/octocat/Hello-World.git           # 200s in the log
-git -C Hello-World push http://127.0.0.1:18002/github.com/octocat/Spoon-Knife.git HEAD:x   # 403: not on the allowlist
-git -C Hello-World push http://127.0.0.1:18002/github.com/octocat/Hello-World.git HEAD:x   # 403: upstream 401, no credential
+GITPROXY_LISTEN=127.0.0.1:18002 GITPROXY_WRITE=github.com/octocat/Hello-World python3 tools/gitproxy/gitproxy.py &
+g() { git -c http.extraHeader='Host: www.github.com' "$@"; }
+g clone http://127.0.0.1:18002/octocat/Hello-World.git                       # 200s in the log
+g -C Hello-World push http://127.0.0.1:18002/octocat/Spoon-Knife.git HEAD:x   # 403: not on the allowlist
+g -C Hello-World push http://127.0.0.1:18002/octocat/Hello-World.git HEAD:x   # 403: upstream 401, no credential
+git clone http://127.0.0.1:18002/octocat/Hello-World.git x                   # 404: host not served here
 ```
 
 ## Why stdlib

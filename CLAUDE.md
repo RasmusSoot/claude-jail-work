@@ -14,7 +14,7 @@ Derived from the home variant (`upstream`, fetch-only); cherry-pick in either di
 - `stacks/<name>.conf`: what a stack jail mounts — generic by rule (repo dir names, primary dir,
   kind cluster, a host port). Client FACTS never go here; they live in `~/claude/jail/.env.<name>`.
 - Host-side scripts: `tools/stack-env.sh` (env file template), `tools/stack-fork.sh` (fork, clone,
-  remotes), `tools/kind-stack.sh` (a stack's kind cluster, registry with push policy, Argo CD),
+  remotes, the gitdir record), `tools/kind-stack.sh` (a stack's kind cluster, registry with push policy, Argo CD),
   `tools/pin-aliases.sh` (`jail-pin`). Those that call `kubectl`/`kind`/`gh` take them from this
   repo's `devbox.json` via `tools/host-tools.sh`. `.aliases`: host launch shortcuts, loopback-only
   ports. `tools/review_md.py` generates `REVIEW.md`.
@@ -22,8 +22,10 @@ Derived from the home variant (`upstream`, fetch-only); cherry-pick in either di
   sidecar), `tools/statusline.sh`, `tools/upload/` (the file-drop server).
 - Sidecars the launcher starts next to a stack jail: `tools/gitproxy/` (git credentials),
   `tools/builder/` (the Paketo build + push), a `kubectl proxy` for the dev cluster.
-- `docs/security.md`: the security model — what is a boundary, what is scenery, what is accepted.
-  Every measure row carries a Review sentence: the rule a reviewer holds a diff to. `REVIEW.md`
+- `docs/security.md`: the security model of the **stack jail** — what is a boundary, what is
+  scenery, what is accepted. `docs/security-jail-main.md`: the same for the login jail, which sees
+  no client content (short; a developer on a stack never opens that jail).
+  Every measure row in both carries a Review sentence: the rule a reviewer holds a diff to. `REVIEW.md`
   is generated from those by `tools/review_md.py` (lint runs it, so the doc's structure is checked;
   the file is gitignored and never edited by hand). Reviewing a change here means reading that
   column, or the generated file.
@@ -32,7 +34,9 @@ Derived from the home variant (`upstream`, fetch-only); cherry-pick in either di
 
 - **Tokens + git are the boundaries; everything else is scenery.** No credential in a jail may be
   able to write to an upstream repo or mutate a client cluster. The launcher is the only place
-  credentials are injected, and every credential it injects is scoped and short-lived.
+  credentials are injected; everything that enters a jail itself is scoped and lives a day at most
+  (kind, Argo) or is harmless (the public-only `gh` token), and the long-lived ones (git, registry)
+  go to sidecars, where policy, not secrecy, bounds what they can do.
 - **Nothing client-derived in this repo** — no copied files, no retyped files, no facts (CIDRs,
   hostnames, SA names, GitLab URLs). Those live in the gitignored per-stack env file.
 - **Pushes are human** under the managed policy (`! git push` from the prompt, or from the host).

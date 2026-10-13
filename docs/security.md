@@ -1,7 +1,10 @@
-# Security model
+# Security model — the stack jail
 
-What keeps a jail's Claude session inside its jail, which measures are real boundaries and which are
-convenience, and what is still open. Generic by rule, like the rest of this repo: no client facts.
+What keeps a stack jail's Claude session inside its jail, which measures are real boundaries and
+which are convenience, and what is still open. Generic by rule, like the rest of this repo: no
+client facts. This is the document for the jail a developer uses. The login jail (`jail-main`) is
+the mechanism's own plumbing, and its model is separate and short:
+[security-jail-main.md](security-jail-main.md).
 
 **Baseline for comparison:** Claude Code running directly on the host under the employer's managed
 policy. It can do everything the host user can. Every measure here makes that smaller; none of
@@ -25,8 +28,9 @@ on a credential staying secret. Instead every credential is classed by what its 
 - **Long** (the account login, the host kubeconfig, the API-scoped tokens the launcher mints
   from): never in a jail.
 - **A day** (the per-launch tokens; 8 h or 24 h are the same class, a workday): may enter a jail
-  only if its scope is acceptable in an attacker's hands for that day. Today only the kind token
-  qualifies, and it is useless outside the host.
+  only if its scope is acceptable in an attacker's hands for that day. Today the kind token and
+  the Argo CD token (get and sync on the stack's own kind Applications) qualify, and both are
+  useless outside the host.
 - **Harmless** (a token whose leak grants nothing anyone lacks): may enter a jail at any lifetime.
   The one example is the optional `gh` token, a fine-grained PAT with public-repository access and
   no permissions; it buys the authenticated rate limit and nothing else. The launcher can verify
@@ -101,8 +105,9 @@ grants the exception explicitly.
 
 ## Architecture
 
-Two kinds of jail. The **stack jail** is the interesting one: it holds client code, and every
-credential it can reach is either scoped to a day and harmless, or behind a sidecar.
+The stack jail holds client code, and every credential it can reach is either scoped to a day and
+harmless, or behind a sidecar. (The account login it reuses comes from the login jail; see
+[security-jail-main.md](security-jail-main.md).)
 
 ```mermaid
 graph LR
@@ -137,7 +142,7 @@ graph LR
     HKUBE --> LAUNCH
     LAUNCH -- "git tokens +<br/>read/write allowlists" --> GP
     LAUNCH -- "dev token, 8h,<br/>after the RBAC gate" --> DP
-    LAUNCH -- "kind token, 8h, after the PSA gate ·<br/>gh public-only PAT after its gate ·<br/>permissions.allow" --> jail
+    LAUNCH -- "kind token, 8h, after the PSA gate ·<br/>Argo token, 8h, after its can-i gate ·<br/>gh public-only PAT after its gate ·<br/>permissions.allow" --> jail
     WS -- "rw, git internals ro" --> jail
     STATE -- "rw" --> jail
 
@@ -150,39 +155,6 @@ graph LR
     DP -- "GET only, no secrets/exec,<br/>RBAC read-only" --> DEV
 ```
 
-The **login jail** (`jail-main`) holds no client content. It mounts this repo read-write, is the one
-session that maps the OAuth callback port, and its login is what every stack jail reuses:
-
-```mermaid
-graph LR
-    subgraph host["Host (work laptop)"]
-        REPO["~/claude/claude-jail-work<br/>this repo"]
-        LSTATE["~/claude/jail/.claude-data<br/>login state"]
-        BROWSER["Browser"]
-    end
-
-    subgraph main["jail-main (login / mechanism)"]
-        MCL(["claude"])
-        UPM["upload :8000"]
-    end
-
-    AI(["claude.ai login"])
-    NIX[("Nix volumes: jail-nix,<br/>jail-nix-#lt;stack#gt; per stack jail")]
-    STACKS(["every stack jail"])
-
-    REPO -- "rw" --> main
-    LSTATE -- "rw" --> main
-    NIX --> main
-    MCL -- "/login via 127.0.0.1:54545" --> AI
-    LSTATE -- ".credentials.json,<br/>single-file mount" --> STACKS
-    BROWSER -- "127.0.0.1:#lt;port#gt;/?t=token" --> UPM
-```
-
-`jail-main` is normally the only session that maps the OAuth callback port
-(`stack-jail.sh <stack> --login` is the exception). It logs in once and every stack jail reuses the
-token through a single-file mount of `.credentials.json`. The browser reaches a stack jail's upload
-server the same way, on that stack's own loopback port.
-
 ## Measures in place
 
 ### Container
@@ -193,21 +165,46 @@ server the same way, on that stack's own loopback port.
 | No sudo; the `claude` user has the host UID/GID | `Dockerfile` | Container root, which would have host-root reach over the bind mounts | A `Dockerfile` change that adds sudo, a setuid binary or a UID/GID other than the host's is a finding. |
 | Stack jails mount `tools/` read-only and get no part of this repo besides it | `docker-compose.yml` | A stack jail rewriting the launcher, `kdev` or the session card | A stack jail must not get this repo read-write, nor anything of it besides `tools/` read-only. |
 | Other stacks' repos (`READS`) mounted read-only, with no tokens or state | `tools/stack-jail.sh` | Writing to or pushing from another stack's tree | `READS` mounts stay read-only and token-less; a writable mount of another stack's tree is a finding. |
-| Jail-only Nix stores (Nix pinned and checksummed in the image): `jail-nix` for the login jail and one `jail-nix-<stack>` volume per stack; the host `/nix` is never mounted | `Dockerfile`, `docker-compose.yml` | A jail replacing store binaries that the host's devbox or Nix profile runs (the host store is single-user and owned by the host UID), or that another stack's jail runs (a cross-client path) | The host `/nix` is never mounted and each stack keeps its own store volume; an unpinned or unchecksummed Nix install in the image is a finding. |
+| Jail-only Nix stores (Nix pinned and checksummed in the image): one `jail-nix-<stack>` volume per stack (the login jail has its own); the host `/nix` is never mounted | `Dockerfile`, `docker-compose.yml` | A jail replacing store binaries that the host's devbox or Nix profile runs (the host store is single-user and owned by the host UID), or that another stack's jail runs (a cross-client path) | The host `/nix` is never mounted and each stack keeps its own store volume; an unpinned or unchecksummed Nix install in the image is a finding. |
+| A per-stack Maven cache volume (`jail-m2-<stack>`, mounted at `~/.m2`): a full build per session is too slow, and it holds what the stack's builds download — same trust as the stack's Nix store, never shared across stacks, never the host's `~/.m2` | `docker-compose.yml` | A jail planting a settings file or a poisoned artifact that another stack's build, or the host's Maven, would use | `~/.m2` stays a per-stack volume; mounting the host's or sharing one across stacks is a finding. |
 | Separate jail git identity; host `~/.gitconfig` not mounted | `docker-compose.yml`, `setup-env.sh` | Host git config (credential helpers, includes) leaking in | Do not mount the host `~/.gitconfig` or any other host dotfile into a jail. |
-| No Docker in the jail, and no image push from it. A stack that names a `BUILDER_IMAGE` gets a build sidecar (`tools/builder/`: that Paketo builder plus helm) in the jail's network namespace, same posture as the proxies (read-only root, no capabilities, no-new-privileges, host UID). It runs the CNB lifecycle creator on requests the jail drops into the shared `build/` dir, exports the image and pushes the chart to the stack's kind registry, and refuses any name outside `BUILD_NAMES`. The registry credential, if the registry wants one, is read by the sidecar and never written where the jail can read it | `tools/builder/`, `tools/build-image`, `tools/stack-jail.sh` | A Docker socket or a daemon-backed build in the jail (host-root reach); a looser jail (user namespaces, seccomp unconfined) for rootless podman; pushes to names outside the stack's own | No Docker socket, daemon or rootless-podman setup in a jail; pushes stay in the sidecar, bounded by `BUILD_NAMES`; the registry credential must never reach a jail-readable path. |
+| No Docker in the jail, and no image push from it. A stack that names a `BUILDER_IMAGE` gets a build sidecar (`tools/builder/`: that Paketo builder plus helm) in the jail's network namespace, same posture as the proxies (read-only root, no capabilities, no-new-privileges, host UID). It runs the CNB lifecycle creator on requests the jail drops into the shared `build/` dir — each copied into the sidecar's own tmpfs before anything reads it, links kept as links, the copy refused if it holds a symlink or special file and built from otherwise, so a swap in the shared dir after the check reaches nothing; pack's `/workspace` and `/layers` are host-only dirs under `.run-<stack>/` — exports the image and pushes the chart to the stack's kind registry, and refuses any name outside `BUILD_NAMES`. The registry credential, if the registry wants one, is read by the sidecar and never written where the jail can read it | `tools/builder/`, `tools/build-image`, `tools/stack-jail.sh` | A Docker socket or a daemon-backed build in the jail (host-root reach); a looser jail (user namespaces, seccomp unconfined) for rootless podman; pushes to names outside the stack's own | No Docker socket, daemon or rootless-podman setup in a jail; pushes stay in the sidecar, bounded by `BUILD_NAMES` and by the registry's own policy (the boundary: build code the jail supplies runs inside the sidecar and can lift the credential there, an accepted risk, so secrecy is not what holds); the launcher and the sidecar themselves must not write the credential anywhere the jail reads, so the sidecar reads a request only from its tmpfs copy and keeps its work dirs out of the shared build dir. |
 | Permission mode is whatever the managed policy allows; the launcher passes no bypass flag (`JAIL_CLAUDE_FLAGS` exists for a granted exception). It does pin a `permissions.allow` list into the stack jail's own settings (default: everything per tool, `JAIL_ALLOW` in the stack conf overrides), which skips the prompt / auto-mode classifier for those tools; a managed deny still wins, and a managed policy may ignore non-managed rules | `tools/stack-jail.sh`, `.aliases` | The jail weakening the employer policy. (The allow list is scenery by design: prompts inside a stack jail guard nothing the tokens and mounts don't; the jail could edit its own settings file anyway) | The launcher must not pass a permission-bypass flag or override managed rules; a pinned allow rule must not become a wrapper around a denied command. |
 
 ### Git
+
+Terms, because the mechanism rests on them. A **repo dir** is a `REPOS` entry under the stack home,
+mounted read-write at `/workspace/<name>`; the conf decides that, and it says nothing about git. A
+**gitdir** is `<repo dir>/.git` as a directory, and that is the only kind there is here: a `.git`
+pointer file or symlink (git follows either to any gitdir), or a `.git/modules` dir, stops the
+launch — **submodules are not supported**, each would be one more gitdir to protect and audit, and
+git names them after their path. A **recorded gitdir** is one listed, with its inode, in the
+host-only record `~/claude/jail/.run-<stack>/gitdirs`: written by `stack-fork.sh` for the clones it
+makes, by the launcher for the notes repo it creates, and by `stack-jail.sh <stack> --adopt
+<dir>/.git` for what the human made on the host and has looked at. Only a recorded gitdir is
+mounted protected, has its remotes read for the push and read lists, and is not an audit hit. A
+**local-only dir** is a repo dir with no recorded gitdir, and it stays one if a `.git` appears in
+it. A gitdir on disk that is not recorded, or whose inode differs from the record, is a **planted
+gitdir** until the human says otherwise: it stops the launch before any token is minted, and the
+exit audit reports it the same day. Against the jail the record is exact: in the jail a repo dir
+and its gitdir are both mountpoints, so a session can neither rename nor replace them, and a
+gitdir absent at any launch is pruned from the record, so one a session makes at that path later
+is unrecorded. The inode is for the host side: a directory replaced by hand with no launch in
+between shows as replaced, unless the filesystem reused the inode number, which only the human's
+own delete-and-re-clone can bring about and is accepted. The scan (`tools/gitdir-scan.sh`) uses
+`find` and `ls` only, never git, treats a directory it cannot read as a refusal, and ends with a
+marker line: a launch or audit that does not see it fails closed. Trust comes from the record,
+never from presence on disk, because the jail writes the disk.
 
 | Measure | Where | Stops | Review: a diff must not… |
 |---|---|---|---|
 | GitHub: fine-grained PAT, resource owner = the fork org, Contents R/W + Metadata, no Pull requests | `.env.<stack>` (filled by the human) | Writing to any upstream or opening PRs | The documented PAT stays fine-grained, fork-org scoped, Contents + Metadata only, no Pull requests permission. |
 | Client GitLab: read-only personal token for fetching; a deploy token with `write_repository` scoped to the human's personal fork, which has a protected `main` | `.env.<stack>`, `tools/stack-jail.sh` | Writing to the client's upstream or to the fork's `main` | GitLab write stays a deploy token on the human's fork with protected `main`; any token with upstream write reach is a finding. |
-| **No git token in the jail.** A `gitproxy` sidecar in the jail's network namespace holds all three and serves git smart-HTTP on `127.0.0.1:8002`, addressed as `http://www.<host>:8002/` (the launcher maps `www.github.com` and `www.<GITLAB_HOST>` to loopback in the namespace holder's `/etc/hosts`; the proxy picks the upstream from the Host header out of that fixed list; the `www.` form is what keeps `gh` resolving the repo from `git remote -v`). The jail's `~/.gitconfig` rewrites every URL shape of both hosts to it (`url.insteadOf`); repo configs stay as the host wrote them. The sidecar forwards only `info/refs`, `git-upload-pack` and `git-receive-pack`, drops client `Authorization` headers, answers an upstream 401 as 403, accepts `git-receive-pack` only for this stack's forks, read on the host from each clone's `origin` (the owner must be `FORK_ORG`; a dir without a clone is not listed) and `GITLAB_FORK_PATH`, and sends the GitHub token only for those forks and each clone's `upstream` (every other github.com repo is fetched anonymously), for any client. Its request log is saved to `~/claude/jail/.run-<stack>/` at session end | `tools/gitproxy/gitproxy.py`, `docker-compose.yml`, `tools/stack-jail.sh`, `tools/stack-jail-init.sh` | Token theft (nothing to copy out of the jail); a push to another stack's fork in the same org, or to anything a mis-scoped token would allow; the GitHub/GitLab REST API with the tokens; a session's git config pointing a push elsewhere | Nothing may put a git token into a jail's env, files or config; the proxy may forward only the three smart-HTTP endpoints, must drop client `Authorization`, and must accept pushes only for the stack's forks. |
-| Each repo's `.git/config`, `.git/hooks` and `.git/commondir` (and every submodule's under `.git/modules`, and the notes repo's) mounted read-only over the rw repo mount, and each gitdir is a bind mount of its own: a mountpoint cannot be renamed away and replaced by a jail-made gitdir (a directory that merely contained the three mounts could). Symlinks in those places stop the launch. `commondir` is written as `.` on the host first: git would otherwise follow a planted `commondir` to a config the jail controls. A pre-existing `commondir` other than `.` stops the launch; a `.git` file (worktree) gets a warning | `tools/stack-jail.sh` | A jail planting a hook, `core.fsmonitor`, `core.sshCommand` or a filter driver that runs on the **host** the next time host git or an IDE touches the repo. Cost: no repo-config writes in the jail (`push -u`, `remote add`, `branch --set-upstream-to`) | `.git/config`, `hooks` and `commondir` stay read-only in stack jails with `commondir` normalized first; a change that lets a jail write repo config is a finding. |
-| Host-side git audit at launch and exit: nested repositories planted in a working tree (gitdirs that existed at launch excepted, by resolved path, not by prefix), a changed `commondir`, `config.worktree`, linked worktrees, and a gitdir or config swapped for another (inode and checksum recorded at launch); paths printed quoted, so a name cannot hide the warning | `tools/stack-jail.sh` | What mounts cannot block: an IDE auto-detecting a planted nested repo and running git in it with *its* config. Warns; deleting is the human's call | The launch and exit audit for planted nested repos, worktrees and `commondir` stays; silencing it is a finding. |
+| **No git token in the jail.** A `gitproxy` sidecar in the jail's network namespace holds all three and serves git smart-HTTP on `127.0.0.1:8002`, addressed as `http://www.<host>:8002/` (the launcher maps `www.github.com` and `www.<GITLAB_HOST>` to loopback in the namespace holder's `/etc/hosts`; the proxy picks the upstream from the Host header out of that fixed list; the `www.` form is what keeps `gh` resolving the repo from `git remote -v`). The jail's `~/.gitconfig` rewrites every URL shape of both hosts to it (`url.insteadOf`); repo configs stay as the host wrote them. The sidecar forwards only `info/refs`, `git-upload-pack` and `git-receive-pack`, drops client `Authorization` headers, answers an upstream 401 as 403, accepts `git-receive-pack` only for this stack's forks, read on the host from each recorded gitdir's `origin` (the owner must be `FORK_ORG`; a local-only dir is not listed, whatever `.git` it holds) and `GITLAB_FORK_PATH`, and sends the GitHub token only for those forks and each clone's `upstream` (every other github.com repo is fetched anonymously), for any client. Its request log is saved to `~/claude/jail/.run-<stack>/` at session end | `tools/gitproxy/gitproxy.py`, `docker-compose.yml`, `tools/stack-jail.sh`, `tools/stack-jail-init.sh` | Token theft (nothing to copy out of the jail); a push to another stack's fork in the same org, or to anything a mis-scoped token would allow; the GitHub/GitLab REST API with the tokens; a session's git config pointing a push elsewhere | Nothing may put a git token into a jail's env, files or config; the proxy may forward only the three smart-HTTP endpoints, must drop client `Authorization`, and must accept pushes only for the stack's forks. |
+| Each recorded gitdir's `config`, `hooks` and `commondir` (the repos' `.git` and the notes repo's) mounted read-only over the rw repo mount, and each gitdir is a bind mount of its own: a mountpoint cannot be renamed away and replaced by a jail-made gitdir (a directory that merely contained the three mounts could). Symlinks in those places stop the launch. `commondir` is written as `.` on the host first: git would otherwise follow a planted `commondir` to a config the jail controls. A pre-existing `commondir` other than `.` stops the launch. A gitdir that is on disk but not in the record, or replaced since it was recorded (absent gitdirs are pruned at each launch; a replaced one has a new inode), stops the launch (with the exact `--adopt` command), so a session cannot turn a local-only dir into a "clone" the next launch would protect, trust and read remotes from; a `.git` pointer file, symlink or `modules` dir stops it outright | `tools/stack-jail.sh`, `tools/gitdir-scan.sh`, `tools/stack-fork.sh` | A jail planting a hook, `core.fsmonitor`, `core.sshCommand` or a filter driver that runs on the **host** the next time host git or an IDE touches the repo. Cost: no repo-config writes in the jail (`push -u`, `remote add`, `branch --set-upstream-to`) | `.git/config`, `hooks` and `commondir` stay read-only in stack jails with `commondir` normalized first, and a gitdir is trusted only through the host-side record by path and inode (`stack-fork.sh` for clones it makes, `--adopt` by explicit name), never because it exists; a change that lets a jail write repo config, adopts a gitdir by its presence, or admits submodules, pointer files or symlinked gitdirs, is a finding. |
+| Host-side git audit at launch and exit, from the same scan as the launch check: nested repositories planted in a working tree (local-only dirs and the build dir included; `.git` dirs, files and links alike), a gitdir that is not recorded or was recreated, a `.git` pointer file or `modules` dir, an unreadable directory, an in-progress rebase or sequencer (its todo would run `exec` lines on the host at `--continue`), a changed `commondir`, `config.worktree`, linked worktrees, and a gitdir or config swapped for another (inode and checksum recorded at launch); paths printed quoted, so a name cannot hide the warning | `tools/stack-jail.sh` | What mounts cannot block: an IDE auto-detecting a planted nested repo and running git in it with *its* config. Warns; deleting is the human's call | The launch and exit audit for planted nested repos, unrecorded gitdirs, worktrees, in-progress rebase or sequencer state and `commondir` stays, covers local-only dirs and the build dir, and fails closed when the scan does not run; silencing or narrowing it, or letting it run git, is a finding. |
 | Remotes are set only on the host, by `tools/stack-fork.sh` with your own `gh` login: fork into the fork org (checked to really be a fork of the upstream), `upstream` with push URL `no_push://disabled`, `origin` = the fork. Its git calls into existing clones set `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` explicitly and disable fsmonitor and hooks; they do read your own git config, on purpose (it is the `gh`-wired identity doing the forking) | `tools/stack-fork.sh` | An accidental push to upstream; a jail rewiring remotes (it can't: `.git/config` is read-only) | Remotes are wired only by `stack-fork.sh`; `upstream` keeps the disabled push URL and the fork is verified to be a fork of the upstream. |
+| One actor per stack at a time: a lock directory in the run dir held by a launch, a `--adopt` and `stack-fork.sh` for their whole run, plus a refusal while the stack's namespace holder (the session) runs; the pre-session audit, run after the mounts are decided, is fatal on any gitdir those mounts do not cover | `tools/stack-jail.sh`, `tools/stack-fork.sh` | A second launch scanning a tree the first session is writing and tearing its sidecars down; a clone made during a launch's gates being mounted with writable config | The launch, `--adopt` and `stack-fork.sh` keep taking the per-stack lock, a launch stays refused while the session's namespace holder runs, and the pre-session audit stays fatal; a diff that removes any of the three is a finding. |
 | Pushes are the human's (`! git push`) | jail card | Code reaching upstream except as a merge request the human opens | Nothing in a jail may push, wrap `git push`, or route a denied verb through a script, `bash -c`, a path or `devbox run` until the AI team's written approval is recorded in this document. |
 
 ### Kubernetes
@@ -215,12 +212,12 @@ server the same way, on that stack's own loopback port.
 | Measure | Where | Stops | Review: a diff must not… |
 |---|---|---|---|
 | Two kubeconfig **files**, never merged: `kind.yaml` (plain `kubectl`), `dev.yaml` (only through `kdev`) | `tools/stack-jail-init.sh` | Pointing a command at the wrong cluster by context mix-up | Never merge the kind and dev kubeconfigs or set one shared `KUBECONFIG`; `dev.yaml` carries no credential. |
-| Both tokens minted per launch from the host credential, 8h, then checked for JWT shape and the expected `sub` claim | `tools/stack-jail.sh` | Injecting a long-lived or wrong-subject token | Any token that enters a jail is minted per launch, at most 8 h, and checked for JWT shape and `sub`; a static or long-lived token is a finding. |
-| kind gate: no token unless the stack namespace enforces Pod Security `baseline`/`restricted`, and the SA cannot patch/update/delete that namespace (asked with the namespace set, the way the API evaluates a request on `namespaces/<ns>`, so a RoleBinding inside it counts), create namespaces, or create pods in any namespace without a Pod Security label (asked per namespace) | `tools/stack-jail.sh` | A namespace admin running a privileged, `hostPath` or `hostPID` pod on a privileged kind node, i.e. reaching the host | The Pod Security gate and the SA can-i checks run before every kind mint; a code path that mints without them is a finding. |
+| Every kind, dev and Argo token minted per launch from the host credential, 8h, then checked for JWT shape and the expected `sub` claim | `tools/stack-jail.sh` | Injecting a long-lived or wrong-subject token | Any token that enters a jail is minted per launch, at most 8 h, and checked for JWT shape and `sub`; a static or long-lived token is a finding. |
+| kind gate: no token unless the stack namespace enforces Pod Security `baseline`/`restricted`, and the SA cannot patch/update/delete that namespace (asked with the namespace set, the way the API evaluates a request on `namespaces/<ns>`, so a RoleBinding inside it counts), create namespaces, and, from its whole `can-i --list` in every namespace: holds nothing but get/list/watch rules (no secrets, no `*/proxy`, `exec`, `attach`, `portforward` or `ephemeralcontainers` with any verb) where there is no Pod Security label — a Deployment, Job or `pods/exec` grant counts as much as `create pods` — and, where there is one, cannot patch/update/delete `namespaces` and holds none of those subresources either; a namespace list that fails or is empty refuses; no Service in the cluster may carry `externalIPs` (kube-proxy would route the node's own address to a pod), and the cluster is created with the `DenyServiceExternalIPs` admission plugin next to kubeadm's default `NodeRestriction` (the gate warns when the first is absent and refuses when the second is) | `tools/stack-jail.sh`, `tools/kind-stack.sh` | A namespace admin running a privileged, `hostPath` or `hostPID` pod on a privileged kind node, i.e. reaching the host | The Pod Security gate and the SA rule-list checks run before every kind mint and fail closed on a missing list; a code path that mints without them, or narrows the per-namespace rule-list check back to one verb or to the stack namespace, or drops the `externalIPs` check, is a finding. |
 | Dev SA gate: the launcher reads its `auth can-i --list` for its namespace by impersonation (every rule that applies there, cluster-scoped ones included; a binding in another namespace does not show, which the proxy's filters cover) and refuses to mint if any rule allows a verb besides get/list/watch, or touches `secrets` or a wildcard resource | `tools/stack-jail.sh` | A mis-scoped "read-only" SA (e.g. `list secrets`, `pods/exec`, `serviceaccounts/token`) reaching the jail | The dev mint keeps refusing on any verb beyond get/list/watch, on `secrets`, or on a wildcard, from the full can-i list, not spot checks. |
 | Dev token never enters the jail: a `kubectl proxy` sidecar in the jail's network namespace holds it and serves on `127.0.0.1:8001`; the jail's `dev.yaml` has no credential. The proxy refuses every method but GET/HEAD and any path segment `secrets`, `exec`, `attach`, `portforward` or `proxy`, for any client (`kdev`, raw `kubectl`, `curl`). Its request log is saved to `~/claude/jail/.run-<stack>/` at session end | `tools/stack-jail.sh` | Token theft (nothing to copy out); writes, secret reads, exec and port-forwards even if a session skips `kdev` | The dev token stays in the proxy sidecar; the proxy keeps refusing non-GET methods and the `secrets`, `exec`, `attach`, `portforward` and `proxy` segments for every client. |
 | `kdev`: read-verb allowlist, refuses `secret` args, prints a cluster banner; runs the repo's devbox `kubectl` with no init_hook | `tools/kdev` | *Convenience.* The proxy and RBAC are the boundary | `kdev` is convenience; a change that makes it the only barrier, such as the proxy permitting what `kdev` filters, is a finding. |
-| Argo CD on kind (the deploy half, when the conf lists `ARGO_APPS`): installed by `kind-stack.sh` from the pinned upstream manifest, one Application per chart name tracking the stack registry (any version), an AppProject that allows only that registry as source, only the stack namespace as destination, no cluster-scoped kinds and no namespaced Role or RoleBinding (a chart could otherwise have the cluster-admin controller bind the workbench SA to cluster-admin inside the namespace, which authorises patching the namespace label away); the install's `default` project is emptied. The jail's token is for a local account (`<stack>-jail`, apiKey only, no UI login) whose whole policy is get, sync and logs on that project; the launcher mints it per launch (8h, its own id, deleted at session end) over the API server's NodePort on the kind network, logging in with the kind cluster's own admin password on stdin, and installs it only after the API, asked *as that token*, answers "no" to app create/update/delete/override (for the project wildcard and for each app name: the policy is glob-matched, so a grant on one name would not show on the wildcard probe), to the default project, account update (= minting more tokens), repository create and project update, and "yes" to sync. The early exit trap revokes the token from the moment it exists. The workbench SA gets a read Role in `argocd` (applications, appprojects), nothing more | `tools/kind-stack.sh`, `tools/stack-jail.sh`, `tools/stack-jail-init.sh` | A session changing what Argo deploys or where (that is the chart's and the project's, both host-applied), minting itself a longer-lived token, syncing anything outside the namespace or cluster-scoped, or editing an Application through the API. `helm install/upgrade` and `kubectl apply` are not needed in the loop, so their denies cost nothing | The Argo account stays get, sync and logs only, its token per launch and revoked at exit, the can-i gate before install; the AppProject keeps one source, one namespace, no cluster-scoped kinds and no Role or RoleBinding. |
+| Argo CD on kind (the deploy half, when the conf lists `ARGO_APPS`): installed by `kind-stack.sh` from the pinned upstream manifest, one Application per chart name tracking the stack registry (any version), an AppProject that allows only that registry as source, only the stack namespace as destination, no cluster-scoped kinds and no namespaced Role or RoleBinding (a chart could otherwise have the cluster-admin controller bind the workbench SA to cluster-admin inside the namespace, which authorises patching the namespace label away); the install's `default` project is emptied. The jail's token is for a local account (`<stack>-jail`, apiKey only, no UI login) whose whole policy is get, sync and logs on that project; the launcher mints it per launch (8h, its own id; at launch and at session end every token on the account is deleted, since Argo CD lets an account manage its own tokens and a session could mint itself a longer one) over the API server's NodePort on the kind network, logging in with the kind cluster's own admin password on stdin over a TLS connection it verifies (the trust anchor is Argo's own server certificate read through the API server, resolved to the node's address, since a Service with `externalIPs` could otherwise capture the connection), between sessions the account is disabled in `argocd-cm`, which refuses every token at once — a launch disables, deletes every token, re-enables and only then mints, and does not mint if it could not clear the account — and installs it only after the cluster's `argocd-rbac-cm` data equals exactly `policy.csv` as `kind-stack.sh argo-policy` renders it plus an empty `policy.default` — no overlay `policy.*.csv`, `matchMode` or `scopes` key, so a grant the probes never ask about, such as an action, exec or another account, cannot hide in a line or a key — and the API, asked *as that token*, answers "no" to app create/update/delete/override (for the project wildcard and for each app name: the policy is glob-matched, so a grant on one name would not show on the wildcard probe), to the default project, update of its own account, of `admin` and of `*`, repository create and project update, and "yes" to sync (the probes are glob-matched, so a grant on one other account would not show in them; the policy-equality gate is what rules those out). Its own tokens an Argo CD account may always mint, past RBAC: the disable at session end is what ends them, every one, a token minted after the deletion pass included. The early exit trap revokes the token from the moment it exists. The workbench SA gets a read Role in `argocd` (applications, appprojects), nothing more | `tools/kind-stack.sh`, `tools/stack-jail.sh`, `tools/stack-jail-init.sh` | A session changing what Argo deploys or where (that is the chart's and the project's, both host-applied), minting itself a longer-lived token, syncing anything outside the namespace or cluster-scoped, or editing an Application through the API. `helm install/upgrade` and `kubectl apply` are not needed in the loop, so their denies cost nothing | The Argo account stays get, sync and logs only, disabled between sessions, its token per launch with every token on the account deleted at launch and at exit, the admin login over verified TLS, the policy-equality and can-i gates before install; the AppProject keeps one source, one namespace, no cluster-scoped kinds and no Role or RoleBinding. |
 
 ### Registry
 
@@ -242,7 +239,7 @@ needs a denied verb, and nothing in the jail holds a credential for it.
 | Both jail services run with `cap_drop: [ALL]` and `no-new-privileges`; sidecars also with a read-only root filesystem and the host UID | `docker-compose.yml`, `tools/stack-jail.sh` | Packet capture on the shared namespace, setuid escalation | Both compose services keep `cap_drop: [ALL]` and `no-new-privileges`; sidecars keep a read-only root and the host UID. |
 | Every published port binds to `127.0.0.1` | `.aliases`, `tools/stack-jail.sh` | Office/client Wi-Fi reaching the upload server or OAuth listener | Every published port binds `127.0.0.1`; `0.0.0.0` or an unbound `-p` is a finding. |
 | Upload server: a random token per container (`?t=` for the page, `X-Upload-Token` for uploads); refuses to start without one; 256 MiB cap | `tools/upload/upload.py`, `tools/jail-entrypoint.sh` | kind pods, other jails on the `kind` network, browser CSRF and DNS rebinding dropping files where Claude reads them | The upload server keeps its per-container token on page and upload, refuses to start without one, and nothing may log or print the upload URL after launch. |
-| Only `jail-main` (or a stack jail launched with `--login`) maps the OAuth callback `54545` | `.aliases`, `tools/stack-jail.sh` | Several sessions racing for the login callback | Only `jail-main` or a `--login` launch maps the OAuth callback port. |
+| A stack jail maps no OAuth callback port unless launched with `--login`; the login is the login jail's job and every stack jail reuses it through a single-file mount of `.credentials.json` | `.aliases`, `tools/stack-jail.sh` | Several sessions racing for the login callback | Only `jail-main` or a `--login` launch maps the OAuth callback port. |
 | Per-jail OTLP identity (`jail.name`, `jail.reads`) | `docker-compose.yml` | Telemetry from different stacks being indistinguishable | Per-jail OTLP identity stays set; nothing here may strip the managed value. |
 
 ### Repo hygiene
@@ -251,18 +248,11 @@ needs a denied verb, and nothing in the jail holds a credential for it.
 |---|---|---|---|
 | Per-stack `notes/` next to the repos: outside every repo, a local git repo with no remote, snapshotted by the launcher before and after each session with a hardened host-side git (explicit `GIT_DIR`/`GIT_COMMON_DIR`, fsmonitor and hooks off, no host config). The upload inbox lives in `notes/uploads/` (gitignored) | `tools/stack-jail.sh` | Notes or uploaded screenshots being committed to a client repo; agent-written notes going unreviewed (`git -C notes log -p`) | `notes/` stays outside every repo, snapshotted before and after with the hardened host git; the inbox stays gitignored. |
 | No client facts in this repo (CIDRs, hostnames, SA names, GitLab URL); they live in the gitignored `.env.<stack>` (mode 600) | `CLAUDE.md`, `.gitignore` | Client data in a repo that may be published | No client fact in the repo — CIDR, hostname, SA name, namespace, GitLab URL; they go to `.env.<stack>`. Gitleaks catches secrets, not facts, so read for these. |
-| Host-side scripts take `kubectl`, `kind` and `gh` from this repo's `devbox.json` (exact versions), never from a stack repo's devbox, which a jail can write | `tools/host-tools.sh`, `devbox.json` | A stale host binary breaking a gate (an old `kubectl` without `create token`); a jail-planted "kubectl" running on the host with your credentials | Host-side scripts take binaries from this repo's `devbox.json` through `host-tools.sh`, never from a stack repo's devbox and never through an `init_hook`. |
+| Host-side scripts take `kubectl`, `kind` and `gh` from this repo's `devbox.json` (exact versions), never from a stack repo's devbox, which a jail can write; without that profile they stop rather than fall back to whatever is on `PATH` | `tools/host-tools.sh`, `devbox.json` | A stale host binary breaking a gate (an old `kubectl` without `create token`); a jail-planted "kubectl" running on the host with your credentials | Host-side scripts take binaries from this repo's `devbox.json` through `host-tools.sh`, never from a stack repo's devbox, never through an `init_hook`, and never from the ambient `PATH` as a fallback. |
 | **The host runs nothing from a stack's tree.** Everything executed on the host with the host's Docker, kubeconfig or `gh` lives in this repo's `tools/` (mounted read-only in stack jails) and is driven by `stacks/<stack>.conf`: cluster and registry lifecycle and the namespace, label, SA and RoleBinding the launcher's gates require (`kind-stack.sh`), forks and remotes (`stack-fork.sh`), the launch itself. A lab repo holds what runs *inside* the jail and what is deployed *into* the namespace | `tools/kind-stack.sh`, `tools/stack-fork.sh`, `tools/stack-jail.sh` | A jail-written script (`kind-up.sh`, a `devbox run` target, a manifest) executed by the human with host privileges — the IDE/build-file risk below, but with Docker and the host kubeconfig | Anything the human runs on the host lives in `tools/` and is driven by `stacks/<stack>.conf`; a host step documented inside a lab repo is a finding. |
-| Host `~/.zshrc` sources a pinned copy (`~/claude/jail/.aliases.pinned`) that only `jail-pin` updates after showing the diff; a mismatch with the repo prints a warning | `tools/pin-aliases.sh`, host `~/.zshrc` | An unreviewed `.aliases` edit running in every new host shell | `.aliases` changes reach the host shell only through `jail-pin`; sourcing the repo copy directly is a finding. |
 
 ## Accepted risks
 
-- **`jail-main` can edit host-executed files.** It mounts this repo rw, and the host runs from that
-  tree: `.aliases`, `stacks/*.conf`, every script in `tools/` that runs on the host (the launcher,
-  `stack-fork.sh`, `stack-env.sh`, `host-tools.sh`, `pin-aliases.sh`), and `devbox.json` /
-  `devbox.lock`, which decide what `kubectl`, `kind` and `gh` the host scripts run. Accepted: `jail-main` sees no client
-  content, so there's little to inject through, every change is a reviewed diff, and the host shell
-  sources a pinned copy of `.aliases`. A separate run-only checkout would close it completely if that changes.
 - **The host IDE shares the jail's working tree.** Mounts and the audit keep git's own machinery
   from running jail-written code. Build files are different: `pom.xml`, `.mvn/`, `devbox.json`
   hooks, `.envrc`, `.vscode/`, `.idea/` run when you build, import or open them on the host. Review
@@ -280,9 +270,6 @@ needs a denied verb, and nothing in the jail holds a credential for it.
 - **Anything running inside the jail can use both proxies**, including repo scripts and test code:
   fetch any repo on the two git hosts with the read tokens, push to the stack's forks, read the dev
   cluster. That is the jail's own trust level; the proxies only bound *what* they can do, and log it.
-- **`jail-main` holds `GH_TOKEN` directly** (`.env`, credential store in `tools/jail-entrypoint.sh`):
-  it has no pod namespace and no sidecar. Accepted for now because it sees only this repo, no
-  client content to be steered by; the token's scope is still the fork org.
 - **`gh` in a stack jail is a read tool with a public-only token, or nothing.** The
   harmless-class token above is in the jail's environment on purpose. Its permission set cannot be
   probed without writing, so "no permissions" rests on the human's token setup; the gate only
@@ -290,7 +277,7 @@ needs a denied verb, and nothing in the jail holds a credential for it.
   run at all (it wants a login even for public reads). With it, every write is refused by GitHub,
   not by anything in the jail.
 - **Every jail holds the Anthropic OAuth credentials**, read-write for token refresh. A compromised
-  jail has the account session.
+  jail has the account session. (The login itself happens in the login jail; see its document.)
 - **Build inputs are latest-at-build-time** (devbox install script, the Claude Code native
   installer, `debian:trixie` by tag). The image is built locally, not by CI, so nothing
   would bump pins: they would only freeze out security fixes. All come over HTTPS from their
@@ -299,12 +286,14 @@ needs a denied verb, and nothing in the jail holds a credential for it.
   images in the launcher.
 - **The build sidecar runs code of the jail's choosing.** Buildpacks and the application's own
   build hooks run inside the sidecar as the unprivileged build user, under the same isolation as
-  the proxies, with the build directory and tmpfs as the only writable paths and the registry
+  the proxies, with the build directory, its host-only work dirs under `.run-<stack>/builder/`
+  (pack's `/workspace` and `/layers`) and tmpfs as the only writable paths and the registry
   credential as the only secret. That is the jail's own trust level; the allowlist bounds *what*
   it can publish, and the log says what it did.
-- **Pushes to the stack's kind registry are read as inside the managed policy's intent** (the
-  policy denies `docker push`): the registry is loopback-only on the host and per stack, the
-  sidecar is the only pusher, and nothing it pushes can reach a real registry. *Not yet ruled on.*
+- **Pushes to the stack's kind registry are read as inside the managed policy's intent — not yet
+  ruled on by the policy owner.** The policy denies `docker push`; the registry is loopback-only
+  on the host and per stack, the sidecar is the only pusher, and nothing it pushes can reach a
+  real registry.
   The human's stated direction (2026-10-12) is broader: once this jail is complete, ask the
   employer's AI team to approve running the jail's devbox-pinned binaries through `devbox run`
   as a sanctioned exception — which, by the text-matching mechanics above, lifts the whole deny
@@ -315,9 +304,9 @@ needs a denied verb, and nothing in the jail holds a credential for it.
   AppProject, not RBAC, bounds what a sync may create (cluster-scoped kinds and namespaced RBAC objects blacklisted). On a disposable cluster whose jail SA is
   already namespace admin that is the same trust as `kubectl` in the namespace, and the project
   and Applications are host-applied, so the jail cannot widen them.
-- **The Argo token travels with TLS verification off** (`ARGOCD_OPTS=--insecure`): the API
-  server's certificate is self-signed and regenerated at start, so pinning it means managing an
-  `argocd-server-tls` Secret. A peer that could answer on the control-plane's address is already
+- **The jail's Argo token travels with TLS verification off** (`ARGOCD_OPTS=--insecure`): the
+  API server's certificate is self-signed, so verifying it in the jail means handing the jail the
+  certificate the launcher reads. (The launcher's own admin login does verify it.) A peer that could answer on the control-plane's address is already
   on the kind network, i.e. a pod the stack runs, and the token is get+sync on one project for 8h.
 - **Network egress is open.** A session can send what it can read anywhere it can reach. The
   answer is to keep what it can read small, not to filter traffic.

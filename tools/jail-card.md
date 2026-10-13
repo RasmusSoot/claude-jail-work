@@ -19,8 +19,11 @@ through; that is exactly why it is on you not to). A denied push means the human
 - **git**: `upstream` remotes are fetch-only. `origin` is the human's fork and the only place a
   push can land. Code reaches upstream only through a merge or pull request the human opens
   under their own name. Add a `Co-Authored-By` trailer to
-  commits you author. In stack jails each repo's `.git/config`, `.git/hooks` and `.git/commondir` are read-only, so
-  `push -u`, `remote add` and `branch --set-upstream-to` fail by design — push without `-u`.
+  commits you author. In stack jails each mounted repo's `.git/config`, `.git/hooks` and `.git/commondir` are read-only, so
+  `push -u`, `remote add` and `branch --set-upstream-to` fail by design — push without `-u`. Do not
+  `git init` or clone inside `/workspace` (a lab dir included) and do not add submodules: the host
+  trusts only the gitdirs it recorded, and any other one stops the next launch until the human has
+  inspected it.
   There is no git token in a stack jail: a credential sidecar on loopback adds it, forwards git
   smart-HTTP only (no GitHub/GitLab API), and refuses pushes to anything but the stack's forks.
   Remotes show as `http://www.<host>:<port>/<owner>/<repo>.git` in `git remote -v`: that name is

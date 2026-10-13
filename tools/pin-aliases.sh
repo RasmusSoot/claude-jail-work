@@ -18,14 +18,16 @@ if [ -f "$pin" ] && cmp -s "$src" "$pin"; then
   echo "pinned copy is up to date ($pin)"
   exit 0
 fi
+snap=$(mktemp) && cp "$src" "$snap"                        # what is shown is what gets pinned: jail-main can edit $src during the prompt
+trap 'rm -f "$snap"' EXIT
 if [ -f "$pin" ]; then
-  diff -u --label "pinned" --label "repo .aliases" "$pin" "$src" || true
+  diff -u --label "pinned" --label "repo .aliases" "$pin" "$snap" | cat -v || true   # -v: an escape sequence cannot hide a line from the reviewer
 else
-  echo "no pinned copy yet — full file:"; cat "$src"
+  echo "no pinned copy yet — full file:"; cat -v "$snap"
 fi
 echo
 read -r -p "Pin this for every new host shell? [y/N] " answer
 case "$answer" in
-  y|Y) install -m 644 "$src" "$pin"; echo "pinned → $pin (new shells pick it up; current: source it)" ;;
+  y|Y) install -m 644 "$snap" "$pin"; echo "pinned → $pin (new shells pick it up; current: source it)" ;;
   *)   echo "not pinned"; exit 1 ;;
 esac

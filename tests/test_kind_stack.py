@@ -18,15 +18,40 @@ from pathlib import Path
 KIND_STACK = Path(__file__).resolve().parents[1] / "tools" / "kind-stack.sh"
 
 
-def render(conf: str, user: str = "pusher") -> dict:
+def run(conf: str, action: str, user: str = "pusher") -> str:
     with tempfile.TemporaryDirectory(prefix="kind-stack-test-") as tmp:
         path = Path(tmp) / "t.conf"
         path.write_text(conf)
         env = {**os.environ, "KIND_STACK_CONF": str(path), "REGISTRY_PUSH_USER": user, "NO_COLOR": "1"}
-        out = subprocess.run(["bash", str(KIND_STACK), "t", "registry-config"], env=env, capture_output=True, text=True, timeout=120)
+        out = subprocess.run(["bash", str(KIND_STACK), "t", action], env=env, capture_output=True, text=True, timeout=120)
     if out.returncode != 0:
         raise RuntimeError(out.stderr)
-    return json.loads(out.stdout)
+    return out.stdout
+
+
+def render(conf: str, user: str = "pusher") -> dict:
+    return json.loads(run(conf, "registry-config", user))
+
+
+class ArgoPolicyTest(unittest.TestCase):
+    """`argo-policy` is what the launcher's gate requires argocd-rbac-cm to equal: get, sync and logs
+    on the stack's project, the project itself readable, one grouping line, nothing else."""
+
+    def test_policy_is_get_sync_logs_on_the_project_only(self):
+        lines = run("KIND_CLUSTER=t\n", "argo-policy").splitlines()
+        self.assertEqual(
+            lines,
+            [
+                "p, role:t-jail, applications, get, t/*, allow",
+                "p, role:t-jail, applications, sync, t/*, allow",
+                "p, role:t-jail, logs, get, t/*, allow",
+                "p, role:t-jail, projects, get, t, allow",
+                "g, t-jail, role:t-jail",
+            ],
+        )
+        for line in lines:
+            if line.startswith("p, "):
+                self.assertIn(line.split(", ")[3], ("get", "sync"))  # the action column, never a write or `*`
 
 
 class RegistryPolicyTest(unittest.TestCase):

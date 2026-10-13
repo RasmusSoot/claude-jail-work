@@ -8,6 +8,8 @@
 #   kind-stack.sh <stack> ui        the Argo CD UI on host loopback (a port-forward: works on Linux,
 #                                   Mac and Windows alike; Ctrl-C ends it), with the admin login
 #   kind-stack.sh <stack> registry-config   print the registry policy `up` renders (no secret in it)
+#   kind-stack.sh <stack> argo-policy       print the Argo CD RBAC policy `up` renders (the launcher's
+#                                   gate requires the cluster's to equal it, line for line)
 #   kind-stack.sh <stack> down      delete the cluster; the registry stays (it is the layer cache)
 #   kind-stack.sh <stack> purge     down + remove the registry container and its volume
 #
@@ -173,12 +175,23 @@ cluster_up() {
     ok "cluster: creating $KIND_CLUSTER"
     local img=(); [ -z "$KIND_NODE_IMAGE" ] || img=(--image "$KIND_NODE_IMAGE")
     {
-      echo 'kind: Cluster'; echo 'apiVersion: kind.x-k8s.io/v1alpha4'
-      if [ -n "$KIND_HTTP_PORT" ]; then
-        cat <<EOT
+      # DenyServiceExternalIPs: a namespace admin could otherwise give a Service the node's own
+      # address and have kube-proxy hand it the launcher's traffic to Argo CD (CVE-2020-8554).
+      cat <<EOT
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
   kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    apiServer:
+      extraArgs:                                  # v1beta4 list form (kind ≥0.26 with k8s ≥1.31); NodeRestriction is kubeadm's default and must be kept
+      - name: enable-admission-plugins
+        value: NodeRestriction,DenyServiceExternalIPs
+EOT
+      if [ -n "$KIND_HTTP_PORT" ]; then
+        cat <<EOT
   - |
     kind: InitConfiguration
     nodeRegistration:
@@ -259,6 +272,14 @@ EOT
 #     logs on this project; the launcher mints an 8h token for it per session (tools/stack-jail.sh);
 #   - a read Role in argocd for the workbench SA, so `kubectl -n argocd get app` works from the jail;
 #   - a 30s reconciliation timeout, so a pushed chart is noticed within a kind-sized wait.
+argo_policy_csv() { # the whole of argocd-rbac-cm policy.csv: get + sync + logs on the project, nothing else
+  printf '%s\n' \
+      "p, role:$ARGO_ACCOUNT, applications, get, $STACK/*, allow" \
+      "p, role:$ARGO_ACCOUNT, applications, sync, $STACK/*, allow" \
+      "p, role:$ARGO_ACCOUNT, logs, get, $STACK/*, allow" \
+      "p, role:$ARGO_ACCOUNT, projects, get, $STACK, allow" \
+      "g, $ARGO_ACCOUNT, role:$ARGO_ACCOUNT"
+}
 argo_up() {
   local app have
   [ -n "$ARGO_APPS" ] || { info "argocd: no ARGO_APPS in stacks/$STACK.conf — not installed"; return; }
@@ -277,12 +298,7 @@ argo_up() {
     -p "{\"data\":{\"accounts.$ARGO_ACCOUNT\":\"apiKey\",\"timeout.reconciliation\":\"30s\",\"timeout.reconciliation.jitter\":\"10s\"}}" >/dev/null
   # Both ConfigMaps come from the install manifest (server-side applied), so they are patched, not
   # re-applied; Argo CD watches them, no restart needed.
-  kc -n "$ARGO_NS" patch cm argocd-rbac-cm --type merge -p "$(jq -n --arg csv "$(printf '%s\n' \
-      "p, role:$ARGO_ACCOUNT, applications, get, $STACK/*, allow" \
-      "p, role:$ARGO_ACCOUNT, applications, sync, $STACK/*, allow" \
-      "p, role:$ARGO_ACCOUNT, logs, get, $STACK/*, allow" \
-      "p, role:$ARGO_ACCOUNT, projects, get, $STACK, allow" \
-      "g, $ARGO_ACCOUNT, role:$ARGO_ACCOUNT")" '{data: {"policy.default": "", "policy.csv": $csv}}')" >/dev/null
+  kc -n "$ARGO_NS" patch cm argocd-rbac-cm --type merge -p "$(jq -n --arg csv "$(argo_policy_csv)" '{data: {"policy.default": "", "policy.csv": $csv}}')" >/dev/null
   kc apply -f - >/dev/null <<EOT
 apiVersion: v1
 kind: Secret
@@ -389,6 +405,7 @@ case "$ACTION" in
   up)     registry_up; cluster_up; registry_wire; stack_rbac; argo_up; echo; status ;;
   status) status ;;
   registry-config) registry_config "${REGISTRY_PUSH_USER:-<push user>}" ;;
+  argo-policy) argo_policy_csv ;;
   ui)     [ -n "$ARGO_APPS" ] || { echo "no ARGO_APPS in stacks/$STACK.conf — no Argo CD on this cluster" >&2; exit 1; }
           # The host's kubeconfig does the forwarding, so no node IP is needed (Docker Desktop
           # cannot reach one). Admin on a disposable cluster's Argo CD, reachable on loopback only:
@@ -400,5 +417,5 @@ case "$ACTION" in
   purge)  cluster_exists && kind delete cluster --name "$KIND_CLUSTER"
           docker rm -f "$REG" >/dev/null 2>&1 || true; docker volume rm "$REG_VOL" >/dev/null 2>&1 || true; rm -rf "$REG_DIR"
           ok "removed cluster $KIND_CLUSTER, registry $REG, volume $REG_VOL and $REG_DIR (the credential stays in $ENV_FILE)" ;;
-  *) echo "usage: kind-stack.sh <stack> up|status|ui|registry-config|down|purge" >&2; exit 2 ;;
+  *) echo "usage: kind-stack.sh <stack> up|status|ui|registry-config|argo-policy|down|purge" >&2; exit 2 ;;
 esac

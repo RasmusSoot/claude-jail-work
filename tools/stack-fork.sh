@@ -10,6 +10,11 @@
 #   2. clone the upstream into $JAIL_HOME/<stack>/<repo> if missing, remote named `upstream`;
 #   3. make `upstream` fetch-only (push URL no_push://disabled);
 #   4. add `origin` = the fork if missing, and fetch it.
+#   5. record a clone it MADE in $JAIL_HOME/.run-<stack>/gitdirs (path + inode): the launcher
+#      protects, trusts and reads remotes from RECORDED gitdirs only (tools/stack-jail.sh, "Terms").
+#      A clone that already exists must be recorded already, or this script refuses to touch it
+#      (its config would be run through git here first): inspect it, then
+#      `stack-jail.sh <stack> --adopt <repo>/.git`. Submodules are not supported.
 # Idempotent: re-run after adding a repo to REPOS. Existing branches and their tracking are left
 # alone. A REPOS entry that is a plain directory without .git (a local-only stack home) is passed
 # over. No rulesets or branch protection are set on the forks.
@@ -49,6 +54,11 @@ hgit() { # <worktree> <git args…> — hardened git for a jail-written clone
     git -c core.fsmonitor= -c core.hooksPath=/dev/null "$@"
 }
 lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+RECORD="$JAIL_HOME/.run-$STACK/gitdirs"                # record_* come from host-tools.sh
+LOCK="$JAIL_HOME/.run-$STACK/lock"                      # the launcher's: one actor per stack (a clone mid-launch would be mounted unprotected)
+mkdir -p "$(dirname "$LOCK")"; chmod 700 "$(dirname "$LOCK")"
+mkdir "$LOCK" 2>/dev/null || { echo "FATAL: $LOCK exists — a $STACK launch, session, --adopt or stack-fork.sh is running; one at a time (a crashed one left it? rmdir $LOCK)" >&2; exit 2; }
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 wait_for_fork() { # <owner/repo>: until the fork reports its default branch and that branch exists
   local repo="$1" db
@@ -69,7 +79,7 @@ for r in $REPOS; do
   echo "── $r"
   # A plain directory (no .git) is a local-only entry — a stack home holding CLAUDE.md, lab files —
   # not a clone to fork or wire. Leave it alone.
-  if [ -d "$dir" ] && [ ! -e "$dir/.git" ]; then echo "   local-only dir, no .git — not a fork, left alone"; continue; fi
+  if [ -d "$dir" ] && [ ! -e "$dir/.git" ]; then echo "   local-only dir, no .git — not a fork, left alone (a .git made here later needs stack-jail.sh $STACK --adopt $r/.git)"; continue; fi
 
   # 1. fork
   if parent=$(gh api "repos/$fork" --jq 'if .fork then .parent.full_name else "" end' 2>/dev/null); then
@@ -82,7 +92,7 @@ for r in $REPOS; do
     echo "   forking $up → $FORK_ORG (default branch only)"
     # --remote is rejected when a repository argument is given; with --clone=false none is added anyway.
     gh repo fork "$up" --org "$FORK_ORG" --default-branch-only --clone=false >/dev/null \
-      || { echo "   ✗ gh repo fork failed" >&2; failed="$failed $r"; continue; }
+      || { echo "   ✗ gh repo fork of $up failed — no such upstream? A local-only dir (a stack home like $r) is not forked: mkdir $dir" >&2; failed="$failed $r"; continue; }
     wait_for_fork "$fork" || { failed="$failed $r"; continue; }
   fi
 
@@ -91,8 +101,15 @@ for r in $REPOS; do
     echo "   cloning $up → $dir"
     git -c core.hooksPath=/dev/null clone -q --origin upstream "https://github.com/$up.git" "$dir" \
       || { echo "   ✗ clone failed" >&2; failed="$failed $r"; continue; }
+    record_add "$RECORD" "$r/.git" "$(gitdir_inode "$dir/.git")"; echo "   recorded $r/.git in $RECORD"
   elif [ ! -d "$dir/.git" ]; then
     echo "   ✗ $dir/.git is not a directory (worktree/submodule?) — skipping" >&2; failed="$failed $r"; continue
+  elif [ -e "$dir/.git/modules" ]; then
+    echo "   ✗ $dir/.git/modules exists — submodules are not supported; skipping" >&2; failed="$failed $r"; continue
+  elif ! record_has "$RECORD" "$r/.git" "$(gitdir_inode "$dir/.git")"; then
+    # Not a clone this script made, or deleted and recreated since: git must not run through its
+    # config from here (fetch would honour remote.*.uploadpack, core.sshCommand, …) before the human has looked.
+    echo "   ✗ $dir/.git is not recorded (or was recreated since): inspect its config and hooks, then: tools/stack-jail.sh $STACK --adopt $r/.git — skipping" >&2; failed="$failed $r"; continue
   fi
   cd_ok=$(cat "$dir/.git/commondir" 2>/dev/null || echo .)
   [ "$cd_ok" = "." ] || { echo "   ✗ $dir/.git/commondir points to '$cd_ok' — inspect before touching it" >&2; failed="$failed $r"; continue; }

@@ -16,7 +16,7 @@
     "init_hook": [],
     "scripts": {
       "lint": [
-        "shellcheck -x -s bash setup-env.sh tools/stack-jail.sh tools/stack-jail-init.sh tools/stack-fork.sh tools/stack-env.sh tools/host-tools.sh tools/pin-aliases.sh tools/kind-stack.sh tools/kdev tools/build-image tools/builder/builder.sh",
+        "shellcheck -x -s bash setup-env.sh tools/stack-jail.sh tools/stack-jail-init.sh tools/gitdir-scan.sh tools/stack-fork.sh tools/stack-env.sh tools/host-tools.sh tools/pin-aliases.sh tools/kind-stack.sh tools/kdev tools/build-image tools/builder/builder.sh",
         "shellcheck -s sh tools/jail-entrypoint.sh",
         "hadolint Dockerfile tools/builder/Dockerfile",
         "gitleaks git --no-banner --redact .",
