@@ -2,7 +2,8 @@
 
 Repo facts only. **Session ground rules do not live here** — they live in
 [`tools/jail-card.md`](tools/jail-card.md), composed into `CLAUDE.local.md` at container start.
-Derived from the home variant (`upstream`, fetch-only); cherry-pick in either direction deliberately.
+Derived from the home variant (`upstream`, fetch-only); cherry-pick in either direction
+deliberately.
 
 ## What this repo is
 
@@ -14,7 +15,8 @@ Derived from the home variant (`upstream`, fetch-only); cherry-pick in either di
 - `stacks/<name>.conf`: what a stack jail mounts — generic by rule (repo dir names, primary dir,
   kind cluster, a host port). Client FACTS never go here; they live in `~/claude/jail/.env.<name>`.
 - Host-side scripts: `tools/stack-env.sh` (env file template), `tools/stack-fork.sh` (fork, clone,
-  remotes, the gitdir record), `tools/kind-stack.sh` (a stack's kind cluster, registry with push policy, Argo CD),
+  remotes, the gitdir record), `tools/kind-stack.sh` (a stack's kind cluster, registry with push
+  policy, Argo CD),
   `tools/pin-aliases.sh` (`jail-pin`). Those that call `kubectl`/`kind`/`gh` take them from this
   repo's `devbox.json` via `tools/host-tools.sh`. `.aliases`: host launch shortcuts, loopback-only
   ports. `tools/review_md.py` generates `REVIEW.md`.
@@ -25,7 +27,8 @@ Derived from the home variant (`upstream`, fetch-only); cherry-pick in either di
 - `docs/security.md`: the security model of the **stack jail** — what is a boundary, what is
   scenery, what is accepted. `docs/security-jail-main.md`: the same for the login jail, which sees
   no client content (short; a developer on a stack never opens that jail).
-  Every measure row in both carries a Review sentence: the rule a reviewer holds a diff to. `REVIEW.md`
+  Every measure row in both carries a Review sentence: the rule a reviewer holds a diff to.
+  `REVIEW.md`
   is generated from those by `tools/review_md.py` (lint runs it, so the doc's structure is checked;
   the file is gitignored and never edited by hand). Reviewing a change here means reading that
   column, or the generated file.

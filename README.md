@@ -1,15 +1,16 @@
 # claude-jail-work — Docker jails for Claude Code, one per stack
 
 The work variant of [claude-jail](https://github.com/teststuffstash/claude-jail): Claude Code in a
-container that holds only one stack's repositories (one client's project, e.g. SiVa) and a few scoped, short-lived credentials,
-under whatever permission mode the account's managed policy allows.
+container that holds only one stack's repositories (one client's project, e.g. SiVa) and a few
+scoped, short-lived credentials, under whatever permission mode the account's managed policy
+allows.
 
 **Design rule:** tokens + git are the boundaries. A jail's credentials cannot write to an upstream
 repository or mutate a client cluster, so the container needs no command filter to be safe.
 The generic security model — boundaries vs scenery, every measure and where it lives, accepted
 risks, open items — is [docs/security.md](docs/security.md) for the stack jail and
-[docs/security-jail-main.md](docs/security-jail-main.md) for the login jail. Client-specific notes stay outside
-this repo.
+[docs/security-jail-main.md](docs/security-jail-main.md) for the login jail. Client-specific notes
+stay outside this repo.
 
 ## Layout on the host
 
@@ -45,15 +46,19 @@ jail-main                       # the login jail: /login once (it maps the OAuth
 
 Fill in `~/claude/jail/.claude-data.gitconfig` (the jail's git identity) while you are at it.
 
-Checks, on the host or in `jail-main`: `devbox run ci` runs shellcheck over every script,
-hadolint over both Dockerfiles (`.hadolint.yaml` lists the one ignored rule and why), gitleaks over the whole git history and the working tree (the "nothing client-derived, no
-credential in git" rule as a check; `.gitleaks.toml` holds the few allowed paths),
-`tools/review_md.py` (generates the gitignored `REVIEW.md` from the security model's Review
-column, which also validates that every measure row has one), `ruff check` (including bandit's rule set, `S`) + `ruff format --check`
-over the Python, and the end-to-end tests in `tests/`
-(each server started against a fake peer and driven through real requests; the build sidecar's
-loop against a fake lifecycle and helm; `kind-stack.sh`'s registry policy rendering). `devbox run lint` and
-`devbox run test` are the halves. The tools are pinned in `devbox.json` next to the host tools.
+Checks, on the host or in `jail-main`: `devbox run ci` (`devbox run lint` and `devbox run test`
+are its halves; the tools are pinned in `devbox.json` next to the host tools). It runs:
+
+- shellcheck over every script, and hadolint over both Dockerfiles (`.hadolint.yaml` lists the one
+  ignored rule and why);
+- gitleaks over the whole git history and the working tree — the "nothing client-derived, no
+  credential in git" rule as a check (`.gitleaks.toml` holds the few allowed paths);
+- `tools/review_md.py`, which generates the gitignored `REVIEW.md` from the security model's
+  Review column and so checks that every measure row has one;
+- `ruff check` (including bandit's rule set, `S`) and `ruff format --check` over the Python;
+- the end-to-end tests in `tests/`: each server started against a fake peer and driven through
+  real requests, the build sidecar's loop against a fake lifecycle and helm, and `kind-stack.sh`'s
+  registry policy rendering.
 
 Per stack (`siva` as the example):
 
@@ -66,23 +71,37 @@ devbox install                  # inside the jail, once: each stack has its own 
 ```
 
 A stack needs a `stacks/<name>.conf` (see `stacks/siva.conf`) and an alias line in `.aliases`
-(then `jail-pin`). `stack-fork.sh` is idempotent: re-run it after adding a repo to `REPOS` —
-remotes can't be changed inside a jail. It also records each clone it makes in
-`~/claude/jail/.run-<stack>/gitdirs` (path and inode): the launcher trusts only recorded gitdirs
-and stops on any other `.git` it finds, printing the exact `tools/stack-jail.sh <stack> --adopt
-<dir>/.git …` to run once you have looked at it (one you made on the host with `git init`, or one
-a session planted). Submodules, `.git` pointer files and symlinked gitdirs are refused outright. `kind-stack.sh` is the whole host side of a stack's kind
-cluster: the per-stack registry (Zot: anyone pulls, one generated credential pushes, and only the
-names in `BUILD_NAMES`; its web UI is on the loopback port), the cluster, containerd's registry config, and the namespace
-(with `pod-security.kubernetes.io/enforce: baseline`, which the launcher requires before minting),
-the workbench ServiceAccount and its RoleBinding — and, when the conf lists `ARGO_APPS`, Argo CD:
-the pinned upstream release, a repository entry for the stack registry's charts (OCI, plain HTTP),
-an AppProject confined to the stack namespace, one auto-syncing Application per chart name, the
-jail's get+sync account, and a read Role so `kubectl -n argocd get app` works from the jail — all
-from the conf, so every stack gets the same shape. `kind-stack.sh <stack> ui` forwards the Argo CD
-UI to host loopback (a port-forward, so it works on Linux, Mac and Windows alike) and prints the
-admin login. **The host runs nothing from a stack's tree**: a lab repo is jail-written, so cluster
-lifecycle and anything else you execute on the host belongs in `tools/`. Identities, by design:
+(then `jail-pin`).
+
+`stack-fork.sh` is idempotent: re-run it after adding a repo to `REPOS`, since remotes cannot be
+changed inside a jail. It also records each clone it makes in `~/claude/jail/.run-<stack>/gitdirs`
+(path and inode). The launcher trusts only recorded gitdirs and stops on any other `.git` it
+finds, printing the exact `tools/stack-jail.sh <stack> --adopt <dir>/.git …` to run once you have
+looked at it (one you made on the host with `git init`, or one a session planted). Submodules,
+`.git` pointer files and symlinked gitdirs are refused outright.
+
+`kind-stack.sh` is the whole host side of a stack's kind cluster, all from the conf, so every
+stack gets the same shape:
+
+- the per-stack registry (Zot: anyone pulls; one generated credential pushes, and only the names
+  in `BUILD_NAMES`; its web UI is on the loopback port);
+- the cluster (node image pinned by `KIND_NODE_IMAGE`) and containerd's registry config on its
+  nodes;
+- the namespace with `pod-security.kubernetes.io/enforce: baseline`, which the launcher requires
+  before minting, plus the workbench ServiceAccount and its RoleBinding;
+- when the conf lists `ARGO_APPS`, Argo CD: the pinned upstream release, a repository entry for
+  the stack registry's charts (OCI, plain HTTP), an AppProject confined to the stack namespace,
+  one auto-syncing Application per chart name, the jail's get+sync account, and a read Role so
+  `kubectl -n argocd get app` works from the jail.
+
+`kind-stack.sh <stack> ui` forwards the Argo CD UI to host loopback (a port-forward, so it works
+on Linux, Mac and Windows alike) and prints the admin login. **The host runs nothing from a
+stack's tree**: a lab repo is jail-written, so cluster lifecycle and anything else you execute on
+the host belongs in `tools/`.
+
+## Identities
+
+By design:
 
 | Purpose | Credential | Reach |
 |---|---|---|
@@ -99,7 +118,8 @@ lifecycle and anything else you execute on the host belongs in `tools/`. Identit
 
 1. Reads `stacks/<stack>.conf` and `~/claude/jail/.env.<stack>`; refuses to continue without the
    shared login file or the primary repo. Pins the status line and a `permissions.allow` list
-   (default: everything per tool; comma-separated `JAIL_ALLOW` in the conf overrides) into the stack's own Claude
+   (default: everything per tool; comma-separated `JAIL_ALLOW` in the conf overrides) into the
+   stack's own Claude
    settings, so the jail runs without prompts for what the managed policy does not deny.
 2. Mints the kind token (only if the namespace enforces Pod Security `baseline`/`restricted` and the
    SA can't undo that), the Argo CD token if the stack has Argo CD (only if the API, asked as that
@@ -111,19 +131,22 @@ lifecycle and anything else you execute on the host belongs in `tools/`. Identit
    and audits the repos for planted nested repositories and unrecorded gitdirs before the session
    and again after it.
 4. Starts the jail's network namespace like a Kubernetes pod: a pause container on a per-stack
-   bridge (+ the kind network) that publishes the upload UI on a loopback port, plus the sidecars
-   in that namespace: the git proxy (`tools/gitproxy/`), which holds the GitHub and GitLab tokens,
-   forwards git smart-HTTP only and accepts pushes only for this stack's forks, on
-   `127.0.0.1:8002`, reached as `www.github.com:8002` / `www.<gitlab>:8002` through the
-   namespace's hosts file (so `gh` still resolves the repo from the remotes); and, if dev is
-   configured, a `kubectl proxy` that holds the dev token and
-   serves read-only on `127.0.0.1:8001`; and, if the conf names a `BUILDER_IMAGE`, the build
-   sidecar (`tools/builder/`: that Paketo builder plus helm, image `jail-<stack>-builder`) that
-   runs the CNB lifecycle on requests from the shared `~/claude/jail/<stack>/build` dir and pushes
-   image and chart to the kind registry, `BUILD_NAMES` only, holding the registry credential the
-   jail never gets (jail side: `tools/build-image`). Then it starts `claude` in that namespace with no git
-   token, no dev token and no bypass flag, and removes the sidecars (saving their request logs)
-   when the session ends.
+   bridge (plus the kind network) that publishes the upload UI on a loopback port, and in that
+   namespace the sidecars:
+   - the git proxy (`tools/gitproxy/`), which holds the GitHub and GitLab tokens, forwards git
+     smart-HTTP only and accepts pushes only for this stack's forks, on `127.0.0.1:8002`, reached
+     as `www.github.com:8002` / `www.<gitlab>:8002` through the namespace's hosts file (so `gh`
+     still resolves the repo from the remotes);
+   - if dev is configured, a `kubectl proxy` that holds the dev token and serves read-only on
+     `127.0.0.1:8001`;
+   - if the conf names a `BUILDER_IMAGE`, the build sidecar (`tools/builder/`: that Paketo
+     builder plus helm, image `jail-<stack>-builder`), which runs the CNB lifecycle on requests
+     from the shared `~/claude/jail/<stack>/build` dir and pushes image and chart to the kind
+     registry, `BUILD_NAMES` only, holding the registry credential the jail never gets (jail
+     side: `tools/build-image`).
+
+   Then it starts `claude` in that namespace with no git token, no dev token and no bypass flag,
+   and removes the sidecars (saving their request logs) when the session ends.
    `tools/stack-jail-init.sh` routes git to the sidecar (`url.insteadOf`, no credential store),
    writes `~/.kube/kind.yaml` and a credential-less `~/.kube/dev.yaml`, and renders the session
    card.

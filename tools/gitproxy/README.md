@@ -58,11 +58,10 @@ mapping, connection handling and that the log holds no token.
 
 ## Test by hand
 
-Inside any jail (or on the host), against GitHub with no credential:
-
-The proxy picks the upstream from the `Host` header (`www.github.com` or `www.<GITLAB_HOST>`,
-which the launcher maps to loopback in the jail's namespace), so by hand the header is set
-explicitly and the path is just `<owner>/<repo>`:
+Inside any jail (or on the host), against GitHub with no credential. The proxy picks the upstream
+from the `Host` header (`www.github.com` or `www.<GITLAB_HOST>`, which the launcher maps to
+loopback in the jail's namespace), so by hand the header is set explicitly and the path is just
+`<owner>/<repo>`:
 
 ```bash
 GITPROXY_LISTEN=127.0.0.1:18002 GITPROXY_WRITE=github.com/octocat/Hello-World python3 tools/gitproxy/gitproxy.py &

@@ -11,16 +11,17 @@ set of scoped credentials. The permission mode is whatever the account's policy 
 jail the launcher pins an allow list (everything per tool, by default) into the jail's own
 settings, because the real boundaries are elsewhere. Do not try to change the mode, and do not
 route around commands the policy still denies — not through a wrapper script, `bash -c`, a path,
-or `devbox run` (rule matching is text, and runners are not stripped, so a denied verb would slip
-through; that is exactly why it is on you not to). A denied push means the human pushes.
+or `devbox run`. Rule matching is on the command text and runners are not stripped, so a denied
+verb would slip through; that is exactly why it is on you not to. A denied push means the human
+pushes.
 
 ## The boundaries (tokens + git — everything else is scenery)
 
 - **git**: `upstream` remotes are fetch-only. `origin` is the human's fork and the only place a
   push can land. Code reaches upstream only through a merge or pull request the human opens
-  under their own name. Add a `Co-Authored-By` trailer to
-  commits you author. In stack jails each mounted repo's `.git/config`, `.git/hooks` and `.git/commondir` are read-only, so
-  `push -u`, `remote add` and `branch --set-upstream-to` fail by design — push without `-u`. Do not
+  under their own name. Add a `Co-Authored-By` trailer to commits you author. In stack jails each
+  mounted repo's `.git/config`, `.git/hooks` and `.git/commondir` are read-only, so `push -u`,
+  `remote add` and `branch --set-upstream-to` fail by design — push without `-u`. Do not
   `git init` or clone inside `/workspace` (a lab dir included) and do not add submodules: the host
   trusts only the gitdirs it recorded, and any other one stops the next launch until the human has
   inspected it.
@@ -38,7 +39,8 @@ through; that is exactly why it is on you not to). A denied push means the human
   verbs are fine there). `kdev` is the CLIENT DEV cluster, read-only through a proxy that holds the
   token (no credential is in this jail): anything but GET, and any secrets, exec, attach,
   port-forward or proxy request, gets 403. `kdev auth can-i` does not work (it is a POST). Never set
-  `KUBECONFIG` by hand, never `use-context`, never merge the two files. Every `kdev` call prints its cluster banner — read it.
+  `KUBECONFIG` by hand, never `use-context`, never merge the two files. Every `kdev` call prints its
+  cluster banner — read it.
 - **argocd**: when the stack has Argo CD on its kind cluster, the session card carries an 8h token
   for an account that can `get`, `sync` and read `logs` on this stack's Applications and nothing
   else — no app, repo, project or account writes; the API answers those with permission denied,
@@ -61,7 +63,8 @@ through; that is exactly why it is on you not to). A denied push means the human
   stack, never the host's), so `devbox install` / `devbox run` work here directly; the same
   committed `devbox.json` works on the host against the host's own store.
 - Memory and session history persist at `/home/claude/.claude` (bind-mounted per stack).
-- A stack may declare `READS`: other stacks' repo dirs mounted read-only under `/reads/<stack>/<repo>`.
+- A stack may declare `READS`: other stacks' repo dirs mounted read-only under
+  `/reads/<stack>/<repo>`.
   They are views, not workspaces — no tokens for them, no commits in them.
 - **No docker, no image push from here.** When the stack has a build sidecar, `build-image` (in
   `tools/`) explodes a jar into `/workspace/build/<id>/` and the sidecar runs the Paketo lifecycle

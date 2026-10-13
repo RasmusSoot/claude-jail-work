@@ -12,8 +12,9 @@ git are the boundaries, everything else is scenery) and the credential classes a
 
 It mounts this repo read-write, the login state directory, the jail git identity file
 (`.claude-data.gitconfig`, which every stack jail copies as its own global git config) and its own
-Nix store volume; it is the one session that maps the OAuth callback port. No stack directory, no stack env file, no kubeconfig,
-no sidecars: it has no pod-style network namespace, because it has nothing to proxy.
+Nix store volume; it is the one session that maps the OAuth callback port. No stack directory, no
+stack env file, no kubeconfig, no sidecars: it has no pod-style network namespace, because it has
+nothing to proxy.
 
 ```mermaid
 graph LR
@@ -65,10 +66,13 @@ ports, pinned Nix) are the same as the stack jail's and reviewed there. What is 
 - **`jail-main` can edit host-executed files.** It mounts this repo rw, and the host runs from that
   tree: `.aliases`, `stacks/*.conf`, every script in `tools/` that runs on the host (the launcher,
   `stack-fork.sh`, `stack-env.sh`, `host-tools.sh`, `pin-aliases.sh`), and `devbox.json` /
-  `devbox.lock`, which decide what `kubectl`, `kind` and `gh` the host scripts run. Accepted: `jail-main` sees no client
+  `devbox.lock`, which decide what `kubectl`, `kind` and `gh` the host scripts run. Accepted:
+  `jail-main` sees no client
   content, so there's little to inject through, every change is a reviewed diff, and the host shell
-  sources a pinned copy of `.aliases`. A separate run-only checkout would close it completely if that changes.
-- **`jail-main` holds `GH_TOKEN` directly** (`.env`, credential store in `tools/jail-entrypoint.sh`):
+  sources a pinned copy of `.aliases`. A separate run-only checkout would close it completely if
+  that changes.
+- **`jail-main` holds `GH_TOKEN` directly** (`.env`, credential store in
+  `tools/jail-entrypoint.sh`):
   it has no pod namespace and no sidecar. Accepted for now because it sees only this repo, no
   client content to be steered by; the token's scope is still the fork org.
 - **It writes the git identity file every stack jail copies.** `.claude-data.gitconfig` is
