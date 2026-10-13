@@ -26,9 +26,11 @@ set -eu
 me="$(dirname "$0")/../.."
 printf '%s\n' "$@" > "$me/creator.args"
 env | sort > "$me/creator.env"
-app=""; layers=""; report=""
-while [ $# -gt 1 ]; do case "$1" in -app) app="$2";; -layers) layers="$2";; -report) report="$2";; esac; shift; done
+app=""; layers=""; report=""; platform=""
+while [ $# -gt 1 ]; do case "$1" in -app) app="$2";; -layers) layers="$2";; -report) report="$2";; -platform) platform="$2";; esac; shift; done
 [ -f "$app/BOOT-INF/marker" ] || { echo "app not copied to $app"; exit 1; }
+rm -rf "$me/platform.env"; cp -r "$platform/env" "$me/platform.env"
+printf '%s\n' "$platform" "$report" > "$me/creator.paths"
 [ -z "$(ls -A "$layers")" ] || { echo "layers not cleared: $(ls -A "$layers")"; exit 1; }
 [ "${FAKE_CREATOR_FAIL:-}" = 1 ] && { echo "boom"; exit 1; }
 printf '[image]\ndigest = "sha256:0000"\n' > "$report"
@@ -70,7 +72,7 @@ class BuilderTest(unittest.TestCase):
         helm = self.bin / "helm"
         helm.write_text(FAKE_HELM)
         helm.chmod(0o755)
-        for d in ("build", "work", "layers", "home"):
+        for d in ("build", "work", "layers", "home", "reqtmp"):
             (self.root / d).mkdir()
         self.proc = None
 
@@ -90,6 +92,7 @@ class BuilderTest(unittest.TestCase):
             "CNB_ROOT": str(self.cnb),
             "WORK_DIR": str(self.root / "work"),
             "LAYERS_DIR": str(self.root / "layers"),
+            "REQ_TMP_DIR": str(self.root / "reqtmp"),
             "BUILD_REGISTRY": REGISTRY,
             "BUILD_NAMES": names,
             "BUILDER_PLATFORM_API": "0.15",
@@ -153,11 +156,37 @@ class BuilderTest(unittest.TestCase):
     def test_buildpack_env_becomes_platform_files_and_other_keys_are_ignored(self):
         self.start()
         self.request("r1", "demo:1", extra="\nBP_JVM_VERSION=21\nBPL_X=y\nEVIL=1")
-        plat = self.root / "build" / "r1" / "platform" / "env"
+        plat = self.root / "platform.env"
         self.assertEqual((plat / "BP_JVM_VERSION").read_text(), "21")
         self.assertEqual((plat / "BPL_X").read_text(), "y")
         self.assertFalse((plat / "EVIL").exists())
         self.assertIn("ignoring key: EVIL", (self.root / "build" / "r1" / "log").read_text())
+
+    def test_request_is_read_from_a_tmpfs_copy_that_is_gone_afterwards(self):
+        # The sidecar's platform dir and report live in its own /tmp copy, not in the shared request
+        # dir, and the copy is removed after the build: nothing of the sidecar's is left for the jail
+        # to swap under the next build, and nothing read from the jail-written dir after `started`.
+        self.start()
+        self.request("r1", "demo:1")
+        platform, report = (self.root / "creator.paths").read_text().split("\n")[:2]
+        copy = self.root / "reqtmp" / "req-r1"  # /tmp/req-<id> in the sidecar (its tmpfs)
+        self.assertEqual(Path(platform), copy / "platform")
+        self.assertEqual(Path(report), copy / "report.toml")
+        self.assertFalse(copy.exists())
+        req = self.root / "build" / "r1"
+        self.assertEqual(sorted(p.name for p in req.iterdir()), ["app", "log", "request", "request.env", "result.env", "started"])
+
+    def test_fifo_in_the_request_is_refused_without_reading_it(self):
+        self.start()
+        d = self.root / "build" / "r1"
+        (d / "app" / "BOOT-INF").mkdir(parents=True)
+        (d / "app" / "BOOT-INF" / "marker").write_text("x")
+        os.mkfifo(d / "request.env")  # a read would block the sidecar forever
+        (d / "request").write_text("")
+        res = self.wait_result(d)
+        self.assertEqual(res["STATUS"], "failed")
+        self.assertIn("symlink or special file", (d / "log").read_text())
+        self.assertFalse((self.root / "creator.args").exists())
 
     def test_failed_lifecycle_is_reported_and_the_loop_keeps_serving(self):
         self.start(FAKE_CREATOR_FAIL="1")
@@ -262,7 +291,7 @@ class BuilderTest(unittest.TestCase):
         self.request("r1", "demo:1", extra="\nBP_A/../../../escaped=1\nBP_OK=2")
         self.assertFalse((self.root / "build" / "escaped").exists())
         self.assertFalse((self.root / "escaped").exists())
-        self.assertEqual(sorted(p.name for p in (self.root / "build" / "r1" / "platform" / "env").iterdir()), ["BP_OK"])
+        self.assertEqual(sorted(p.name for p in (self.root / "platform.env").iterdir()), ["BP_OK"])
         self.assertIn("ignoring key: BP_A/../../../escaped", (self.root / "build" / "r1" / "log").read_text())
 
     # ── the credential ────────────────────────────────────────────────────────────────────────────

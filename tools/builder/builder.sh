@@ -8,20 +8,21 @@
 #   /build/<id>/chart.tgz       optional, a packaged Helm chart to push after the image
 #   /build/<id>/request.env     IMAGE=<name>:<tag>  CHART=<chart name>  BP_*=…  (one KEY=value per line)
 #   /build/<id>/request         marker: the request is complete, build it
-#   /build/<id>/log             appended while building
+#   /build/<id>/log             appended while building (the one file written while reading the request;
+#                               the request itself is read from a tmpfs copy, see build_one)
 #   /build/<id>/result.env      STATUS=ok|failed  IMAGE=<ref>  IMAGE_DIGEST=…  CHART=…  CHART_DIGEST=…
 # Policy, for any caller: <name> and <chart name> must be in BUILD_NAMES; every push goes to
 # BUILD_REGISTRY; the registry credential (REGISTRY_PUSH_USER/PASSWORD, if any) is read once here
 # and never written anywhere the jail can read. Requests are built one at a time, oldest first.
 set -euo pipefail
 
-BUILD="${BUILD_ROOT:-/build}"; CNB="${CNB_ROOT:-/cnb}"           # overridable for tests only
+BUILD="${BUILD_ROOT:-/build}"; CNB="${CNB_ROOT:-/cnb}"; REQ_TMP="${REQ_TMP_DIR:-/tmp}"   # overridable for tests only
 # The app and layers directories are pack's fixed /workspace and /layers, not paths under the
 # request dir: a CNB layer tar carries its absolute path, so the exported image and the cache image
 # both bake the layers dir in. Per-request paths meant the running image had its layers under
 # /build/<id>/ and every cache restore was skipped as "path escapes destination root". Both dirs
-# are bind mounts the launcher owns (<build dir>/.workspace, .layers), cleared before each build
-# like pack's fresh volumes; builds are serialized, so one of each is enough.
+# are bind mounts the launcher owns (host-only, under ~/claude/jail/.run-<stack>/builder/), cleared
+# before each build like pack's fresh volumes; builds are serialized, so one of each is enough.
 WORK="${WORK_DIR:-/workspace}"; LAYERS="${LAYERS_DIR:-/layers}"
 REGISTRY="${BUILD_REGISTRY:?BUILD_REGISTRY unset}"
 NAMES=" ${BUILD_NAMES:?BUILD_NAMES unset} "
@@ -77,15 +78,27 @@ result() { # <dir> KEY=value… — written whole, then renamed: the jail never 
 }
 
 build_one() { # <request dir>
-  local d="$1" id image="" chart="" name tag ref line k v idig="" cdig="" cname ctgz
-  id=$(basename "$d")
-  # Nothing in a request may be a symlink: the sidecar reads what the jail cannot (its own tmpfs
-  # with the registry credential), and cp/ls/helm would follow a link there and copy it into the
-  # shared build dir. The request dir itself is checked by the loop below.
-  if [ -n "$(find "$d" -type l -print -quit 2>/dev/null)" ]; then
-    echo "refused: the request contains a symlink ($(find "$d" -type l -print -quit))" >> "$d/log"; result "$d" STATUS=failed; return
+  local d="$1" t bad
+  t="$REQ_TMP/req-$(basename "$d")"
+  # The request is copied into this sidecar's own tmpfs first, links kept as links (-RP), and the
+  # COPY is checked and built from. A check on the shared dir would be check-then-use: the jail
+  # sees `started` and can swap `app` or `request.env` for a symlink to /tmp/helm/registry.json
+  # between the check and the cp/read, and the credential would land in the build dir or the log.
+  # A FIFO would hang the read. Only `log` (streamed to the jail) and `result.env` go back.
+  rm -rf "$t"
+  if ! cp -RP "$d" "$t" 2>>"$d/log"; then echo "refused: could not copy the request" >> "$d/log"; result "$d" STATUS=failed; rm -rf "$t"; return; fi
+  bad=$(find "$t" ! -type f ! -type d -print -quit 2>/dev/null)
+  if [ -n "$bad" ]; then
+    echo "refused: the request contains a symlink or special file ($d${bad#"$t"})" >> "$d/log"; result "$d" STATUS=failed; rm -rf "$t"; return
   fi
-  rm -rf "$d/platform" "$d/layers" "$d/report.toml"; mkdir -p "$d/platform/env"
+  build_copy "$d" "$t" || log "$(basename "$d"): unexpected error (see its log)"
+  rm -rf "$t"
+}
+
+build_copy() { # <request dir: log and result go here> <its copy in tmpfs: everything is read from here>
+  local d="$1" t="$2" id image="" chart="" name tag ref line k v idig="" cdig="" cname ctgz
+  id=$(basename "$d")
+  mkdir -p "$t/platform/env"
   { echo "── $id: $(date -u +%FT%TZ)"; } >> "$d/log"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
@@ -93,10 +106,10 @@ build_one() { # <request dir>
     case "$k" in
       IMAGE) image="$v" ;;
       CHART) chart="$v" ;;
-      *) if [[ $k =~ ^BPL?_[A-Z0-9_]+$ ]]; then printf '%s' "$v" > "$d/platform/env/$k"   # buildpack inputs, as files; the regex admits no "/" (a case glob would)
+      *) if [[ $k =~ ^BPL?_[A-Z0-9_]+$ ]]; then printf '%s' "$v" > "$t/platform/env/$k"   # buildpack inputs, as files; the regex admits no "/" (a case glob would)
          else echo "ignoring key: $k" >> "$d/log"; fi ;;
     esac
-  done < "$d/request.env"
+  done < "$t/request.env"
 
   # Validate before anything leaves: name:tag shape, name on the allowlist, an app dir to build.
   if ! printf '%s' "$image" | grep -qE '^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
@@ -106,41 +119,40 @@ build_one() { # <request dir>
   if ! allowed "$name"; then
     echo "refused: image name '$name' is not in BUILD_NAMES (${BUILD_NAMES})" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image"; return
   fi
-  if [ ! -d "$d/app" ] || [ -z "$(ls -A "$d/app" 2>/dev/null)" ]; then
+  if [ ! -d "$t/app" ] || [ -z "$(ls -A "$t/app" 2>/dev/null)" ]; then
     echo "refused: $d/app is missing or empty" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image"; return
   fi
   ctgz=""
-  if [ -n "$chart" ] || [ -f "$d/chart.tgz" ]; then
-    [ -f "$d/chart.tgz" ] || { echo "refused: CHART=$chart but no chart.tgz" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image"; return; }
-    ctgz="/tmp/chart-$id.tgz"; cp "$d/chart.tgz" "$ctgz"     # validated and pushed from tmpfs: the jail cannot swap it between the two
+  if [ -n "$chart" ] || [ -f "$t/chart.tgz" ]; then
+    [ -f "$t/chart.tgz" ] || { echo "refused: CHART=$chart but no chart.tgz" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image"; return; }
+    ctgz="$t/chart.tgz"                                      # validated and pushed from the tmpfs copy: the jail cannot swap it between the two
     cname=$(helm show chart "$ctgz" 2>>"$d/log" | sed -n 's/^name: *//p' | head -1)
     if [ -z "$cname" ] || [ "$cname" != "$chart" ] || ! allowed "$cname"; then
-      echo "refused: chart.tgz is '$cname', CHART=$chart; must match and be in BUILD_NAMES" >> "$d/log"; rm -f "$ctgz"; result "$d" STATUS=failed "IMAGE=$image"; return
+      echo "refused: chart.tgz is '$cname', CHART=$chart; must match and be in BUILD_NAMES" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image"; return
     fi
   fi
 
   ref="$REGISTRY/$name:$tag"
   log "$id: building $ref${chart:+ + chart $chart}"
   find "$WORK" "$LAYERS" -mindepth 1 -delete 2>/dev/null || true
-  cp -a "$d/app/." "$WORK/"
+  cp -a "$t/app/." "$WORK/"
   # The creator = detect+analyze+restore+build+export in one process, as this (unprivileged) user,
   # the app and layers at pack's paths, platform and report under the request dir, the cache as an
   # image in the same registry (one per name; restored into /layers, so rebuilds reuse the JRE etc.).
-  if ! "$CNB/lifecycle/creator" -app "$WORK" -layers "$LAYERS" -platform "$d/platform" \
-        -run-image "$RUN_IMAGE" -cache-image "$REGISTRY/$name-cache" -report "$d/report.toml" \
+  if ! "$CNB/lifecycle/creator" -app "$WORK" -layers "$LAYERS" -platform "$t/platform" \
+        -run-image "$RUN_IMAGE" -cache-image "$REGISTRY/$name-cache" -report "$t/report.toml" \
         -log-level info "$ref" >> "$d/log" 2>&1; then
-    log "$id: image build FAILED"; [ -z "$ctgz" ] || rm -f "$ctgz"; result "$d" STATUS=failed "IMAGE=$ref"; return
+    log "$id: image build FAILED"; result "$d" STATUS=failed "IMAGE=$ref"; return
   fi
-  idig=$(sed -n 's/^ *digest *= *"\([^"]*\)".*/\1/p' "$d/report.toml" 2>/dev/null | head -1)
+  idig=$(sed -n 's/^ *digest *= *"\([^"]*\)".*/\1/p' "$t/report.toml" 2>/dev/null | head -1)
   if [ -n "$chart" ]; then
-    if ! helm push "$ctgz" "oci://$REGISTRY/charts" --plain-http > "$d/chart-push.out" 2>&1; then
-      cat "$d/chart-push.out" >> "$d/log"; log "$id: chart push FAILED"; rm -f "$ctgz"
+    if ! helm push "$ctgz" "oci://$REGISTRY/charts" --plain-http > "$t/chart-push.out" 2>&1; then
+      cat "$t/chart-push.out" >> "$d/log"; log "$id: chart push FAILED"
       result "$d" STATUS=failed "IMAGE=$ref" "IMAGE_DIGEST=$idig" "CHART=$chart"; return
     fi
-    cat "$d/chart-push.out" >> "$d/log"
-    cdig=$(sed -n 's/^Digest: *//p' "$d/chart-push.out" | head -1); rm -f "$d/chart-push.out"
+    cat "$t/chart-push.out" >> "$d/log"
+    cdig=$(sed -n 's/^Digest: *//p' "$t/chart-push.out" | head -1)
   fi
-  [ -z "$ctgz" ] || rm -f "$ctgz"
   log "$id: done $ref${idig:+@$idig}${chart:+; chart $chart${cdig:+@$cdig}}"
   result "$d" STATUS=ok "IMAGE=$ref" "IMAGE_DIGEST=$idig" "CHART=$chart" "CHART_DIGEST=$cdig"
 }
@@ -156,7 +168,7 @@ while :; do
     fi
     [ -f "$d/request" ] && [ ! -e "$d/result.env" ] && [ ! -e "$d/started" ] || continue
     : > "$d/started"
-    build_one "$d" || log "$(basename "$d"): unexpected error (see its log)"
+    build_one "$d"
   done
   sleep 1
 done
