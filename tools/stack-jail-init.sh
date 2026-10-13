@@ -6,6 +6,20 @@
 
 _sj_warn() { echo "stack-jail-init: $*" >&2; }
 
+# ── --second (tools/stack-jail.sh): a second session joining the running jail ───────────────────
+# The first session's init already wrote ~/.gitconfig, the kubeconfigs and the card. Rewriting them
+# truncates each file in place, and the primary's git or kubectl could read it empty (no proxy
+# rewrite, no identity). So: the exports the first init makes, no file written.
+if [ -n "${STACK_JAIL_SECOND:-}" ]; then
+  [ -z "${STACK_GITPROXY:-}" ] || export GIT_TERMINAL_PROMPT=0
+  [ ! -f "$HOME/.kube/kind.yaml" ] || export KUBECONFIG="$HOME/.kube/kind.yaml"
+  [ -z "${STACK_ARGO_TOKEN:-}" ] || export ARGOCD_SERVER="$STACK_ARGO_SERVER" ARGOCD_AUTH_TOKEN="$STACK_ARGO_TOKEN" ARGOCD_OPTS="--insecure"
+  export PATH="/workspace/tools:$PATH"
+  unset STACK_KUBE_TOKEN STACK_KUBE_CA STACK_ARGO_TOKEN
+  unset -f _sj_warn
+  return 0
+fi
+
 # ── git identity + routing through the credential sidecar ───────────────────────────────────────
 # No token and no credential helper in here. Every URL shape of github.com and the client GitLab
 # (https, http, scp-style ssh, ssh://) is rewritten to http://www.<host>:<port>/, which is the
@@ -113,6 +127,9 @@ EOT
 } > /workspace/CLAUDE.local.md 2>/dev/null || _sj_warn "could not write /workspace/CLAUDE.local.md"
 
 unset _sj_kind _sj_dev _sj_git _sj_gh _sj_build _sj_argo        # GH_TOKEN stays: it is gh's, public-read-only, gated by the launcher
+# Tidiness, not a boundary: this clears claude's own environment only. The `docker run -e` values
+# stay in /proc/1/environ, readable by every process here (same user). Nothing gained by reading
+# them: the kube token is in kind.yaml, the Argo one is ARGOCD_AUTH_TOKEN.
 unset STACK_KUBE_TOKEN STACK_KUBE_CA STACK_ARGO_TOKEN            # ARGOCD_AUTH_TOKEN stays: it is argocd's, get+sync only, gated by the launcher
 unset -f _sj_warn _sj_kubeconfig _sj_route 2>/dev/null
 true

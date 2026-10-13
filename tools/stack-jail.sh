@@ -3,6 +3,7 @@
 #
 #   stack-jail.sh <stack> [--login]
 #   stack-jail.sh <stack> --adopt [<dir>/.git …]   record gitdirs the human made on the host (see "Terms" below)
+#   stack-jail.sh <stack> --second                 a second Claude in the RUNNING jail: notes only (tools/second-jail.md)
 #
 # One jail per stack (a client's project, e.g. SiVa). What a stack IS comes from two files:
 #   stacks/<stack>.conf          committed, generic: repos, primary dir, kind cluster, upload port,
@@ -47,7 +48,8 @@ JAIL_HOME="${JAIL_HOME:-$HOME/claude/jail}"         # per-stack workspaces live 
 STACK="${1:-}"; shift || true
 LOGIN=0; [ "${1:-}" = "--login" ] && LOGIN=1
 ADOPT=0; ADOPT_PATHS=(); if [ "${1:-}" = "--adopt" ]; then ADOPT=1; shift; ADOPT_PATHS=("$@"); fi   # record named gitdirs, then exit
-[ -n "$STACK" ] || { echo "usage: stack-jail.sh <stack> [--login | --adopt [<dir>/.git …]]" >&2; exit 2; }
+SECOND=0; [ "${1:-}" = "--second" ] && SECOND=1
+[ -n "$STACK" ] || { echo "usage: stack-jail.sh <stack> [--login | --adopt [<dir>/.git …] | --second]" >&2; exit 2; }
 
 CONF="$HERE/stacks/$STACK.conf"
 [ -f "$CONF" ] || { fail "FATAL: $CONF missing — add a stacks/<stack>.conf (see stacks/siva.conf)"; exit 2; }
@@ -55,6 +57,18 @@ CONF="$HERE/stacks/$STACK.conf"
 . "$CONF"
 : "${REPOS:?stacks/$STACK.conf must set REPOS}" "${PRIMARY:?must set PRIMARY}" "${UPLOAD_PORT:?must set UPLOAD_PORT}"
 for r in $REPOS; do case "$r" in notes|build|tools) fail "FATAL: stacks/$STACK.conf lists a repo named '$r' — /workspace/$r is the stack's $r mount"; exit 2;; esac; done
+# --second: another Claude process inside the jail that is already running — no lock, no gates, no
+# mints, no mounts, no sidecars: it joins what the first launch set up and dies with it (the jail's
+# main process is the first session). Its init (STACK_JAIL_SECOND) only exports — the first one's
+# files are live, a rewrite would race them — and it gets tools/second-jail.md as its rules: read the repos and
+# clusters, write only notes/, no git writes, no pushes. Those rules are discipline, not a boundary;
+# the boundary is that it holds nothing the first session does not.
+if [ "$SECOND" = 1 ]; then
+  [ "$(docker container inspect -f '{{.State.Running}}' "jail-$STACK" 2>/dev/null)" = true ] \
+    || { fail "FATAL: jail-$STACK is not running — start it first ($STACK), then $STACK --second"; exit 2; }
+  exec docker exec -it -w "/workspace/$PRIMARY" "jail-$STACK" \
+    bash -c 'r=$(cat /workspace/tools/second-jail.md) || exit 2; export STACK_JAIL_SECOND=1; source /workspace/tools/stack-jail-init.sh && exec claude --append-system-prompt "$r" '"${JAIL_CLAUDE_FLAGS:-}"   # no rules file, no session
+fi
 for _c in "$HERE"/stacks/*.conf; do                 # a host port is one stack's: a clash would surface only at `docker run`, after the mints
   [ "$_c" != "$CONF" ] || continue
   _u=$(sed -n 's/^UPLOAD_PORT=\([0-9]*\).*/\1/p' "$_c" | head -1); _r=$(sed -n 's/^REGISTRY_PORT=\([0-9]*\).*/\1/p' "$_c" | head -1)

@@ -67,11 +67,18 @@ tools/stack-env.sh siva         # creates ~/claude/jail/.env.siva (mode 600) —
 tools/stack-fork.sh siva        # fork into FORK_ORG, clone from UPSTREAM_OWNER, wire remotes, record the gitdirs
 tools/kind-stack.sh siva up     # the stack's kind cluster + registry + namespace/SA the launcher mints for
 siva                            # the stack jail (alias for tools/stack-jail.sh siva)
+siva --second                   # a second Claude in the running siva jail: reads, plans, writes notes/ only
 devbox install                  # inside the jail, once: each stack has its own Nix store
 ```
 
 A stack needs a `stacks/<name>.conf` (see `stacks/siva.conf`) and an alias line in `.aliases`
 (then `jail-pin`).
+
+One launch per stack at a time. To plan the next feature while the session builds the current one,
+`<stack> --second` starts a second Claude in the running jail with `docker exec`. It has no lock, no
+gates and no new credentials or mounts, and it stops when the first session exits. Its rules come
+from `tools/second-jail.md`: read the repos and clusters, write only under `notes/` (plans in
+`notes/plans/`), no git writes and no pushes; the primary session picks the notes up.
 
 `stack-fork.sh` is idempotent: re-run it after adding a repo to `REPOS`, since remotes cannot be
 changed inside a jail. It also records each clone it makes in `~/claude/jail/.run-<stack>/gitdirs`
