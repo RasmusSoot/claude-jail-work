@@ -360,7 +360,12 @@ roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: $KIND_SA-argoc
 subjects: [{ kind: ServiceAccount, name: $KIND_SA, namespace: $KIND_NS }]
 EOT
   # The install's `default` project allows every source, destination and kind; nothing here uses
-  # it, and nothing in a jail can create an Application, but an empty project costs nothing.
+  # it, and nothing in a jail can create an Application, but an empty project costs nothing. The
+  # server creates that project at its first start, not the manifest: on a fresh install, wait for it.
+  local _
+  for _ in $(seq 1 60); do kc -n "$ARGO_NS" get appproject default >/dev/null 2>&1 && break; sleep 2; done
+  kc -n "$ARGO_NS" get appproject default >/dev/null 2>&1 \
+    || { fail "argocd: the server has not created the default AppProject after 120s — is argocd-server starting? (kubectl --context $CTX -n $ARGO_NS get pods)"; exit 2; }
   kc -n "$ARGO_NS" patch appproject default --type merge -p '{"spec":{"sourceRepos":[],"destinations":[],"clusterResourceWhitelist":[]}}' >/dev/null
   for app in $ARGO_APPS; do
     kc apply -f - >/dev/null <<EOT
