@@ -23,6 +23,48 @@ stay outside this repo.
 ~/claude/jail/.run-<stack>/         sidecar request logs (git proxy, dev proxy), one each per session
 ```
 
+## Quickstart
+
+From an empty machine to a running jail for one of the predefined stacks (`stacks/`: `siva`,
+`siga`, `tara`, `govsso`, `ai-governance`), `siva` as the example. [Bootstrap](#bootstrap) and
+[Identities](#identities) have the detail behind each step. It is written to be worked through
+with Claude Code on the host (point it at this file); the steps that touch GitHub are yours.
+
+1. **An org for the forks.** Create a GitHub organization you own (the free plan is enough), with
+   fine-grained tokens allowed in its settings. It is the trust domain: the forks live there, the
+   git token is scoped to it, so it holds nothing else. Its name is `FORK_ORG`.
+2. **The git token** (GitHub → Settings → Developer settings → Fine-grained tokens): resource
+   owner = that org, All repositories, permissions Contents read/write and Metadata read, nothing
+   else. It never enters the jail: the git proxy sidecar holds it. This is `GH_TOKEN`.
+3. **The `gh` token, optional**: a second fine-grained token, resource owner = you, Public
+   repositories only, no permissions. It is the one token that enters the jail, so the launcher
+   refuses anything broader. This is `GH_PUBLIC_TOKEN`; without it `gh` does not run in the jail.
+4. **This repo on the host.** Docker with the compose plugin, devbox and `gh auth login` first.
+   ```bash
+   git clone <this repo> ~/claude/claude-jail-work && cd ~/claude/claude-jail-work
+   ./setup-env.sh                  # .env, ~/claude/jail/ and the state files
+   docker compose build
+   tools/pin-aliases.sh            # then add the ~/.zshrc snippet from its header; open a new shell
+   ```
+5. **Log in once**: `jail-main`, then `/login` inside it. Every stack jail reuses that login.
+   Fill in `~/claude/jail/.claude-data.gitconfig` (the jail's commit identity).
+6. **The stack's env file**: `tools/stack-env.sh siva` creates `~/claude/jail/.env.siva`. Fill in
+   `GH_TOKEN`, `FORK_ORG`, `UPSTREAM_OWNER` (the GitHub owner of the repos in the conf's `REPOS`)
+   and, if you made one, `GH_PUBLIC_TOKEN`. The GitLab and dev-cluster lines stay empty until the
+   stack has them; the registry credential is generated in the next step.
+7. **The stack home**: `mkdir -p ~/claude/jail/siva/siva-lab`. It is the conf's `PRIMARY`, a
+   local-only directory that is not forked (the fork script passes over it and the launcher
+   refuses to start without it); its `CLAUDE.md` is what the session reads first.
+8. **Fork, cluster, launch**:
+   ```bash
+   tools/stack-fork.sh siva        # forks into FORK_ORG, clones, wires the remotes
+   tools/kind-stack.sh siva up     # kind cluster, registry, namespace, SA; Argo CD if the conf has ARGO_APPS
+   siva                            # the jail; inside it, once: devbox install
+   ```
+
+A stack of your own needs a `stacks/<name>.conf` (copy one) and an alias line in `.aliases`,
+then `jail-pin`; the steps are the same.
+
 ## Bootstrap
 
 Host prerequisites: Docker with the compose plugin, devbox, and `gh` logged in (for
@@ -72,7 +114,8 @@ devbox install                  # inside the jail, once: each stack has its own 
 ```
 
 A stack needs a `stacks/<name>.conf` (see `stacks/siva.conf`) and an alias line in `.aliases`
-(then `jail-pin`).
+(then `jail-pin`); the predefined ones in `stacks/` have both. The conf's `PRIMARY` is a local-only
+stack home that the fork script does not create: `mkdir` it before the first launch.
 
 One launch per stack at a time. To plan the next feature while the session builds the current one,
 `<stack> --second` starts a second Claude in the running jail with `docker exec`. It has no lock, no
