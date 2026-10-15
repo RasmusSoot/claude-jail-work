@@ -142,10 +142,15 @@ stack gets the same shape:
 - when the conf lists `ARGO_APPS`, Argo CD: the pinned upstream release, a repository entry for
   the stack registry's charts (OCI, plain HTTP), an AppProject confined to the stack namespace,
   one auto-syncing Application per chart name, the jail's get+sync account, and a read Role so
-  `kubectl -n argocd get app` works from the jail.
+  `kubectl -n argocd get app` works from the jail;
+- when the conf also lists `KIND_ADDONS`, the cluster add-ons the jail cannot install (CRDs,
+  ClusterRoles: first of them kube-prometheus-stack), one Application per file in `addons/`, in an
+  Argo project `platform` limited to those files' public chart repos and namespaces; the jail sees
+  them and cannot sync them ([`addons/README.md`](addons/README.md)).
 
 `kind-stack.sh <stack> ui` forwards the Argo CD UI to host loopback (a port-forward, so it works
-on Linux, Mac and Windows alike) and prints the admin login. **The host runs nothing from a
+on Linux, Mac and Windows alike) and prints the admin login; `kind-stack.sh <stack> grafana` does
+the same for Grafana when kube-prometheus-stack is among the add-ons. **The host runs nothing from a
 stack's tree**: a lab repo is jail-written, so cluster lifecycle and anything else you execute on
 the host belongs in `tools/`.
 

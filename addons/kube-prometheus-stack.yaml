@@ -1,0 +1,70 @@
+# kube-prometheus-stack — Prometheus (operator, CRDs, kube-state-metrics) and Grafana, kind-sized.
+# Host-applied by tools/kind-stack.sh <stack> up when the conf lists it in KIND_ADDONS; see README.md here.
+# An app in a stack's chart gets scraped by shipping a ServiceMonitor/PodMonitor: Prometheus selects
+# them, and PrometheusRules and Probes, from every namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+  # no finalizer: the cluster is disposable, and deleting the Application should not take the stack with it
+spec:
+  project: platform
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 91.9.0             # a deliberate pin (2026-10-02); bump by hand, after reading the chart's upgrade notes
+    helm:
+      releaseName: kube-prometheus-stack   # fixes the object names: svc/kube-prometheus-stack-grafana is what `kind-stack.sh grafana` forwards
+      valuesObject:
+        # Kind exposes no controller-manager, scheduler, etcd or kube-proxy metrics endpoint (they
+        # bind to the node's loopback); coreDns' scrape Service would land in kube-system, outside the
+        # platform project's destinations. Alertmanager and node-exporter (a hostPath, hostPID pod
+        # per node) are not needed on a dev cluster.
+        kubeControllerManager: { enabled: false }
+        kubeScheduler: { enabled: false }
+        kubeEtcd: { enabled: false }
+        kubeProxy: { enabled: false }
+        coreDns: { enabled: false }
+        alertmanager: { enabled: false }
+        nodeExporter: { enabled: false }
+        # The operator's admission webhook gets its CA patched in by a Job after install; Argo's
+        # self-heal would revert that patch on every sync. Off, with the TLS it would serve.
+        prometheusOperator:
+          admissionWebhooks: { enabled: false }
+          tls: { enabled: false }
+        prometheus:
+          prometheusSpec:
+            # nil selector = every object in every namespace, not only those carrying this release's label
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+            probeSelectorNilUsesHelmValues: false
+            scrapeConfigSelectorNilUsesHelmValues: false
+            retention: 2d
+            # A ServiceMonitor from any namespace (a jail's chart ships one) must not be able to name a
+            # file on Prometheus's filesystem, e.g. bearerTokenFile = its own SA token, sent to a jail pod.
+            arbitraryFSAccessThroughSMs: { deny: true }
+        grafana:
+          enabled: true
+          service: { type: ClusterIP }   # no NodePort: reached through `kind-stack.sh <stack> grafana` (a port-forward)
+          # The chart's own admin Secret is a random password per render (helm `lookup` returns
+          # nothing under Argo CD), which would restart Grafana on every reconcile. The host creates
+          # this one once instead (tools/kind-stack.sh, kube-prometheus-stack prerequisites).
+          admin:
+            existingSecret: grafana-admin
+            userKey: admin-user
+            passwordKey: admin-password
+          # Anonymous Viewer: what a session deploys it must be able to see, and a session's curl pod can
+          # then list and read dashboards and run their queries. That is no more than the pod already
+          # reads from Prometheus directly; editing, datasources, users and the admin login stay closed.
+          grafana.ini:
+            auth.anonymous: { enabled: true, org_role: Viewer }
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+    - CreateNamespace=true
+    - ServerSideApply=true             # the CRDs exceed the last-applied annotation's size limit under client-side apply

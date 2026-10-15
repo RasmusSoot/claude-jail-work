@@ -3,13 +3,16 @@
 #
 #   kind-stack.sh <stack> up        create or repair: registry (with its push credential), cluster, containerd registry config,
 #                                   the stack namespace (Pod Security label), workbench SA + RoleBinding,
-#                                   and, if ARGO_APPS is set, Argo CD with one Application per chart
+#                                   and, if ARGO_APPS is set, Argo CD with one Application per chart,
+#                                   plus the KIND_ADDONS Applications in project `platform`
 #   kind-stack.sh <stack> status    what exists, what the launcher's gates will say
 #   kind-stack.sh <stack> ui        the Argo CD UI on host loopback (a port-forward: works on Linux,
 #                                   Mac and Windows alike; Ctrl-C ends it), with the admin login
+#   kind-stack.sh <stack> grafana   the same for Grafana, when KIND_ADDONS lists kube-prometheus-stack
 #   kind-stack.sh <stack> registry-config   print the registry policy `up` renders (no secret in it)
 #   kind-stack.sh <stack> argo-policy       print the Argo CD RBAC policy `up` renders (the launcher's
 #                                   gate requires the cluster's to equal it, line for line)
+#   kind-stack.sh <stack> addons-render     print the `platform` AppProject `up` applies for KIND_ADDONS (JSON)
 #   kind-stack.sh <stack> down      delete the cluster; the registry stays (it is the layer cache)
 #   kind-stack.sh <stack> purge     down + remove the registry container and its storage dir
 #
@@ -30,6 +33,12 @@
 #                     installed from its upstream manifest; ARGO_NODEPORT (default 30443) is where the
 #                     API server listens on the nodes — the jail reaches it as <cluster>-control-plane:<port>.
 #                     ARGO_UI_PORT (default 8443) is the host loopback port `ui` forwards to it.
+#   KIND_ADDONS       cluster-scoped add-ons the jail cannot install, space-separated names (optional;
+#                     needs ARGO_APPS, since they are Argo CD Applications): each is addons/<name>.yaml
+#                     in THIS repo, applied by `up` into AppProject `platform`, which allows exactly the
+#                     chart repos and namespaces those files declare and every cluster-scoped kind.
+#                     Removing a name does not uninstall it. GRAFANA_UI_PORT (default 3000) is the
+#                     host loopback port `grafana` forwards to (kube-prometheus-stack).
 #   BUILD_NAMES       the names the build sidecar may push (tools/stack-jail.sh); here they are also
 #                     the registry's push policy: the push user may write exactly <name>, <name>-cache
 #                     and charts/<name> for each, nothing else. Re-run `up` after changing them.
@@ -46,8 +55,9 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=tools/host-tools.sh
 . "$HERE/tools/host-tools.sh"                        # kind/kubectl pinned by this repo's devbox.json
 STACK="${1:-}"; ACTION="${2:-status}"
-[ -n "$STACK" ] || { echo "usage: kind-stack.sh <stack> up|status|ui|registry-config|down|purge" >&2; exit 2; }
+[ -n "$STACK" ] || { echo "usage: kind-stack.sh <stack> up|status|ui|grafana|registry-config|argo-policy|addons-render|down|purge" >&2; exit 2; }
 CONF="${KIND_STACK_CONF:-$HERE/stacks/$STACK.conf}"             # the override is for tests/ only
+readonly ADDONS_DIR="${KIND_ADDONS_DIR:-$HERE/addons}"         # likewise; set before the conf and readonly, so a conf cannot move it
 [ -f "$CONF" ] || { fail "FATAL: $CONF missing"; exit 2; }
 # shellcheck source=/dev/null
 . "$CONF"
@@ -62,6 +72,8 @@ REG_DIR="$JAIL_HOME/.registry-$STACK"                             # policy + bcr
 ARGO_APPS="${ARGO_APPS:-}"; ARGO_VERSION="${ARGO_VERSION:-v3.5.5}"; ARGO_NODEPORT="${ARGO_NODEPORT:-30443}"
 ARGO_NS=argocd; ARGO_ACCOUNT="$STACK-jail"                   # the account the launcher mints session tokens for
 ARGO_UI_PORT="${ARGO_UI_PORT:-8443}"
+KIND_ADDONS="${KIND_ADDONS:-}"; GRAFANA_UI_PORT="${GRAFANA_UI_PORT:-3000}"
+GRAFANA_NS=monitoring; GRAFANA_SECRET=grafana-admin               # what addons/kube-prometheus-stack.yaml declares
 REG="jail-$STACK-registry"; REG_VOL="jail-registry-$STACK"; CTX="kind-$KIND_CLUSTER"   # REG_VOL: the old root-owned volume, removed when met
 REG_DATA="$JAIL_HOME/.registry-$STACK-data"                       # layers and charts, owned by the host user (the registry runs as that user)
 kc() { kubectl --context "$CTX" "$@"; }
@@ -446,6 +458,118 @@ EOT
   ok "argocd: $ARGO_VERSION on $KIND_CLUSTER-control-plane:$ARGO_NODEPORT; apps [$ARGO_APPS] from $REG:5000/charts into $KIND_NS; account $ARGO_ACCOUNT = get+sync on project $STACK"
 }
 
+# Cluster add-ons (KIND_ADDONS): what a namespace-admin jail cannot install — CRDs, ClusterRoles,
+# webhooks — installed by the host and kept in sync by the same Argo CD, in a project of their own.
+# The file is what the host applies with cluster-admin and the project is built from it, so before
+# anything is applied each listed file must say what the conf says: one Application document named
+# <name> in argocd, project platform, a public https chart repo (never the stack registry, which
+# the jail pushes to: a jail-pushed chart in this project would be cluster-admin), an exact version,
+# a namespace of its own, the chart's values inline. Block-style YAML: lines the parse cannot place
+# are ignored, so the required paths must each occur exactly once; a quoted key and any `---` (a
+# leading one included) are refused outright.
+addon_fields() { # <file> → "dotted.path=value" per mapping key (lists and comments skipped)
+  awk '
+    /^---/ { print "!multidoc"; next }
+    /^ *["\047]/ { print "!quotedkey"; next }
+    /^[[:space:]]*(#|$)/ { next }
+    { match($0, /^ */); ind = RLENGTH; line = substr($0, ind + 1)
+      if (line ~ /^- / || !match(line, /^[A-Za-z0-9_.\/-]+:/)) next
+      key = substr(line, 1, RLENGTH - 1); val = substr(line, RLENGTH + 1)
+      while (n > 0 && indent[n] >= ind) n--
+      n++; indent[n] = ind; name[n] = key; p = name[1]; for (i = 2; i <= n; i++) p = p "." name[i]
+      sub(/[[:space:]]+#.*$/, "", val); gsub(/^[[:space:]]+|[[:space:]]+$/, "", val); gsub(/^["\047]|["\047]$/, "", val)
+      print p "=" val }' "$1"
+}
+addon_field() { # <fields> <path> → its value; fails unless the path occurs exactly once
+  printf '%s\n' "$1" | awk -v k="$2" '{ i = index($0, "="); if (substr($0, 1, i - 1) == k) { c++; v = substr($0, i + 1) } }
+                                       END { if (c != 1) exit 1; print v }'
+}
+addons_check() { # sets ADDON_REPOS ADDON_NSES (deduplicated) from the files KIND_ADDONS names; exit 2 on any mismatch
+  local n f fields v repo ns
+  ADDON_REPOS=(); ADDON_NSES=()
+  # `platform` as a stack would have addons_project apply over the stack's own project (blacklist gone, cluster `*`).
+  [ -z "$KIND_ADDONS" ] || [ "$STACK" != platform ] || { fail "FATAL: a stack named platform cannot have KIND_ADDONS — the name is the addons' AppProject"; exit 2; }
+  for n in $KIND_ADDONS; do
+    [[ "$n" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { fail "FATAL: KIND_ADDONS: '$n' is not an addon name"; exit 2; }
+    case " $ARGO_APPS " in *" $n "*) fail "FATAL: $n is in both KIND_ADDONS and ARGO_APPS — the two Applications would overwrite each other"; exit 2 ;; esac
+    f="$ADDONS_DIR/$n.yaml"
+    [ -f "$f" ] || { fail "FATAL: KIND_ADDONS: $n — no $f"; exit 2; }
+    fields=$(addon_fields "$f")
+    bad() { fail "FATAL: addons/$n.yaml: $*"; exit 2; }
+    printf '%s\n' "$fields" | grep -qx '!multidoc' && bad "a --- line (one YAML document, no separator)"
+    printf '%s\n' "$fields" | grep -qx '!quotedkey' && bad "a quoted key (plain keys only, so a duplicate cannot slip past a check)"
+    [ "$(addon_field "$fields" apiVersion)" = argoproj.io/v1alpha1 ] && [ "$(addon_field "$fields" kind)" = Application ] \
+      || bad "not one argoproj.io/v1alpha1 Application"
+    [ "$(addon_field "$fields" metadata.name)" = "$n" ] || bad "metadata.name is not $n"
+    [ "$(addon_field "$fields" metadata.namespace)" = "$ARGO_NS" ] || bad "metadata.namespace is not $ARGO_NS"
+    [ "$(addon_field "$fields" spec.project)" = platform ] || bad "spec.project is not platform"
+    printf '%s\n' "$fields" | grep -q '^spec\.sources[.=]' && bad "spec.sources (multi-source) — one spec.source only"
+    printf '%s\n' "$fields" | grep -q '^spec\.source\.\(path\|plugin\)[.=]' && bad "spec.source.path or .plugin — a Helm chart only"
+    printf '%s\n' "$fields" | grep -q '^spec\.source\.helm\.\(valueFiles\|fileParameters\)[.=]' && bad "spec.source.helm.valueFiles or .fileParameters — values inline only"
+    addon_field "$fields" spec.source.chart >/dev/null || bad "no single spec.source.chart"
+    repo=$(addon_field "$fields" spec.source.repoURL) || bad "no single spec.source.repoURL"
+    [[ "$repo" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/-]*)?$ ]] || bad "spec.source.repoURL '$repo' is not a public https chart repo"
+    v=$(addon_field "$fields" spec.source.targetRevision) || bad "no spec.source.targetRevision"
+    [[ "$v" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]] || bad "spec.source.targetRevision '$v' is not a pinned version"
+    ns=$(addon_field "$fields" spec.destination.namespace) || bad "no single spec.destination.namespace"
+    [[ "$ns" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || bad "spec.destination.namespace '$ns' is not a namespace name"
+    case "$ns" in "$ARGO_NS"|"$KIND_NS"|default|kube-system|kube-public|kube-node-lease) bad "spec.destination.namespace '$ns' is not a namespace of its own" ;; esac
+    [ "$(addon_field "$fields" spec.destination.server)" = https://kubernetes.default.svc ] || bad "spec.destination.server is not https://kubernetes.default.svc"
+    if [ "$n" = kube-prometheus-stack ]; then   # what `grafana` and the Secret below assume
+      [ "$ns" = "$GRAFANA_NS" ] || bad "spec.destination.namespace is not $GRAFANA_NS"
+      [ "$(addon_field "$fields" spec.source.helm.valuesObject.grafana.admin.existingSecret)" = "$GRAFANA_SECRET" ] \
+        || bad "grafana.admin.existingSecret is not $GRAFANA_SECRET"
+    fi
+    unset -f bad
+    case " ${ADDON_REPOS[*]-} " in *" $repo "*) ;; *) ADDON_REPOS+=("$repo") ;; esac
+    case " ${ADDON_NSES[*]-} " in *" $ns "*) ;; *) ADDON_NSES+=("$ns") ;; esac
+  done
+}
+# The project: exactly those repos and namespaces, every cluster-scoped kind (the point of an addon)
+# and every namespaced one. Nothing in a jail is granted on it — argo_policy_csv names $STACK/* only,
+# so the jail sees platform apps through its read Role and cannot sync them. JSON: kubectl takes it.
+addons_project() {
+  jq -n --arg ns "$ARGO_NS" --arg repos "${ADDON_REPOS[*]}" --arg nses "${ADDON_NSES[*]}" '
+    {apiVersion: "argoproj.io/v1alpha1", kind: "AppProject",
+     metadata: {name: "platform", namespace: $ns},
+     spec: {description: "host-installed cluster add-ons (tools/kind-stack.sh, addons/): public charts, pinned, cluster-scoped kinds allowed",
+            sourceRepos: ($repos | split(" ")),
+            destinations: [$nses | split(" ")[] | {server: "https://kubernetes.default.svc", namespace: .}],
+            clusterResourceWhitelist: [{group: "*", kind: "*"}]}}'
+}
+# Grafana's admin Secret (the addon file names it as admin.existingSecret): made once, kept across
+# re-runs. The chart's own would be re-randomised on every Argo render and restart Grafana each time.
+grafana_secret() {
+  local pass
+  kc create namespace "$GRAFANA_NS" --dry-run=client -o yaml | kc apply -f - >/dev/null
+  kc -n "$GRAFANA_NS" get secret "$GRAFANA_SECRET" >/dev/null 2>&1 && return
+  pass=$(head -c 30 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
+  kc apply -f - >/dev/null <<EOT
+apiVersion: v1
+kind: Secret
+metadata: { name: $GRAFANA_SECRET, namespace: $GRAFANA_NS }
+stringData:
+  admin-user: admin
+  admin-password: $pass
+EOT
+  ok "addons: Grafana admin password generated (Secret $GRAFANA_SECRET in $GRAFANA_NS; kind-stack.sh $STACK grafana prints it)"
+}
+addons_up() {
+  local n
+  if [ -z "$KIND_ADDONS" ]; then   # a conf edit never uninstalls: what an earlier run applied stays until deleted by hand
+    ! kc -n "$ARGO_NS" get appproject platform >/dev/null 2>&1 \
+      || info "addons: none in KIND_ADDONS; project platform and its apps from an earlier run left in place"
+    return
+  fi
+  addons_project | kc apply -f - >/dev/null
+  case " $KIND_ADDONS " in *" kube-prometheus-stack "*) grafana_secret ;; esac
+  for n in $KIND_ADDONS; do
+    kc apply -f "$ADDONS_DIR/$n.yaml" >/dev/null
+    kc -n "$ARGO_NS" annotate applications.argoproj.io "$n" argocd.argoproj.io/refresh=hard --overwrite >/dev/null
+  done
+  ok "addons: [$KIND_ADDONS] in project platform (sources [${ADDON_REPOS[*]}], namespaces [${ADDON_NSES[*]}]); nothing in the jail is granted on it"
+}
+
 status() {
   local psa app
   if cluster_exists; then
@@ -457,13 +581,19 @@ status() {
       if [ -n "$ARGO_APPS" ]; then
         if kc -n "$ARGO_NS" get deploy argocd-server >/dev/null 2>&1; then
           echo "argocd: $(kc -n "$ARGO_NS" get deploy argocd-server -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's/.*://') on $KIND_CLUSTER-control-plane:$ARGO_NODEPORT, account $ARGO_ACCOUNT$(kc -n "$ARGO_NS" get cm argocd-cm -o jsonpath="{.data.accounts\.$ARGO_ACCOUNT}" 2>/dev/null | grep -q apiKey || echo ' MISSING — run: kind-stack.sh '"$STACK"' up')"
-          kc -n "$ARGO_NS" get applications.argoproj.io -o custom-columns='  app:.metadata.name,sync:.status.sync.status,health:.status.health.status,revision:.status.sync.revision' 2>/dev/null || true
-          for app in $ARGO_APPS; do   # why a sync is Unknown: the controller's conditions (repo unreachable, no version matched, …)
+          kc -n "$ARGO_NS" get applications.argoproj.io -o custom-columns='  app:.metadata.name,project:.spec.project,sync:.status.sync.status,health:.status.health.status,revision:.status.sync.revision' 2>/dev/null || true
+          for app in $ARGO_APPS $KIND_ADDONS; do   # why a sync is Unknown: the controller's conditions (repo unreachable, no version matched, …)
             kc -n "$ARGO_NS" get applications.argoproj.io "$app" -o jsonpath='{range .status.conditions[*]}{"  '"$app"': "}{.type}{": "}{.message}{"\n"}{end}' 2>/dev/null || true
           done
+          if [ -n "$KIND_ADDONS" ]; then   # the platform apps are in the table above (project platform)
+            kc -n "$ARGO_NS" get appproject platform >/dev/null 2>&1 && echo "addons: project platform, apps [$KIND_ADDONS]" \
+              || echo "addons: MISSING (KIND_ADDONS is set) — run: kind-stack.sh $STACK up"
+          fi
         else
           echo "argocd: MISSING (ARGO_APPS is set) — run: kind-stack.sh $STACK up"
         fi
+      elif [ -n "$KIND_ADDONS" ]; then
+        echo "addons: KIND_ADDONS is set but ARGO_APPS is empty — no Argo CD, so no addons; set ARGO_APPS"
       fi
     else
       echo "cluster $KIND_CLUSTER: exists but NOT running — run: kind-stack.sh $STACK up"
@@ -477,10 +607,22 @@ status() {
 }
 
 case "$ACTION" in
-  up)     registry_up; cluster_up; registry_wire; stack_rbac; argo_up; echo; status ;;
+  up)     # Addons are Argo CD Applications, and Argo CD comes only with ARGO_APPS; checked before anything is made.
+          [ -z "$KIND_ADDONS" ] || [ -n "$ARGO_APPS" ] \
+            || { fail "FATAL: KIND_ADDONS is set but ARGO_APPS is empty — addons need Argo CD, which is installed only with ARGO_APPS"; exit 2; }
+          addons_check
+          registry_up; cluster_up; registry_wire; stack_rbac; argo_up; addons_up; echo; status ;;
   status) status ;;
   registry-config) registry_config "${REGISTRY_PUSH_USER:-<push user>}" ;;
   argo-policy) argo_policy_csv ;;
+  addons-render) addons_check
+          if [ -n "$KIND_ADDONS" ]; then addons_project; else info "addons: no KIND_ADDONS — no platform project" >&2; fi ;;
+  grafana) case " $KIND_ADDONS " in *" kube-prometheus-stack "*) ;;
+             *) echo "kube-prometheus-stack is not in KIND_ADDONS in stacks/$STACK.conf — no Grafana on this cluster" >&2; exit 1 ;; esac
+          # As `ui`: the host's kubeconfig forwards, loopback only, a disposable cluster's admin login.
+          ok "grafana: http://127.0.0.1:$GRAFANA_UI_PORT — user admin, password: $(kc -n "$GRAFANA_NS" get secret "$GRAFANA_SECRET" -o jsonpath='{.data.admin-password}' | base64 -d)"
+          echo "  Ctrl-C ends the forward. GRAFANA_UI_PORT in the conf or the environment picks another port."
+          exec kubectl --context "$CTX" -n "$GRAFANA_NS" port-forward --address 127.0.0.1 svc/kube-prometheus-stack-grafana "$GRAFANA_UI_PORT:80" ;;
   ui)     [ -n "$ARGO_APPS" ] || { echo "no ARGO_APPS in stacks/$STACK.conf — no Argo CD on this cluster" >&2; exit 1; }
           # The host's kubeconfig does the forwarding, so no node IP is needed (Docker Desktop
           # cannot reach one). Admin on a disposable cluster's Argo CD, reachable on loopback only:
@@ -492,5 +634,5 @@ case "$ACTION" in
   purge)  cluster_exists && kind delete cluster --name "$KIND_CLUSTER"
           docker rm -f "$REG" >/dev/null 2>&1 || true; docker volume rm "$REG_VOL" >/dev/null 2>&1 || true; rm -rf "$REG_DIR" "$REG_DATA"
           ok "removed cluster $KIND_CLUSTER, registry $REG, its storage $REG_DATA and $REG_DIR (the credential stays in $ENV_FILE)" ;;
-  *) echo "usage: kind-stack.sh <stack> up|status|ui|registry-config|argo-policy|down|purge" >&2; exit 2 ;;
+  *) echo "usage: kind-stack.sh <stack> up|status|ui|grafana|registry-config|argo-policy|addons-render|down|purge" >&2; exit 2 ;;
 esac

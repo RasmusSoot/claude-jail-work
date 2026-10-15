@@ -237,6 +237,20 @@ have the cluster-admin controller bind the workbench SA to cluster-admin inside 
 which authorises patching the namespace label away); the install's `default` project is emptied.
 The workbench SA gets a read Role in `argocd` (applications, appprojects), nothing more.
 
+**Cluster add-ons** are what a namespace-admin jail cannot install: charts that bring CRDs,
+ClusterRoles or webhooks (the first is kube-prometheus-stack, so a stack's chart can ship a
+ServiceMonitor). A conf opts in with `KIND_ADDONS`; each name is a file `addons/<name>.yaml` in
+this repo — one Application, a public `https` chart repo, an exact chart version, a namespace of its
+own — and `kind-stack.sh up` refuses the run unless the file says what the conf says (name,
+`argocd`, project `platform`, one document, one source; never the stack registry, which the jail
+pushes to). It then applies a second AppProject, `platform`, whose sources and destinations are
+exactly the repos and namespaces those files declare and which allows every cluster-scoped kind,
+and the files. Nothing in a jail is granted on it: the jail account's policy stays `<stack>/*`, so
+a session sees the platform apps through its read Role and cannot sync them; their content is
+the pinned public chart and the host-applied values. A conf edit never uninstalls one. Grafana's
+admin password is a Secret the host generates once (the chart's own would be re-randomised on every
+Argo render); `kind-stack.sh <stack> grafana` forwards it to host loopback, as `ui` does Argo's.
+
 The jail's token belongs to a local account (`<stack>-jail`, apiKey only, no UI login) whose whole
 policy is get, sync and logs on that project. The launcher mints it per launch (8h, its own id)
 over the API server's NodePort on the kind network, logging in with the kind cluster's own admin
@@ -267,7 +281,8 @@ would not show in them; the policy-equality check is what rules those out.
 | Dev SA gate: the launcher reads its `auth can-i --list` for its namespace by impersonation (every rule that applies there, cluster-scoped ones included; a binding in another namespace does not show, which the proxy's filters cover) and refuses to mint if any rule allows a verb besides get/list/watch, or touches `secrets` or a wildcard resource | `tools/stack-jail.sh` | A mis-scoped "read-only" SA (e.g. `list secrets`, `pods/exec`, `serviceaccounts/token`) reaching the jail | The dev mint keeps refusing on any verb beyond get/list/watch, on `secrets`, or on a wildcard, from the full can-i list, not spot checks. |
 | Dev token never enters the jail: a `kubectl proxy` sidecar in the jail's network namespace holds it and serves on `127.0.0.1:8001`; the jail's `dev.yaml` has no credential. The proxy refuses every method but GET/HEAD and any path segment `secrets`, `exec`, `attach`, `portforward` or `proxy`, for any client (`kdev`, raw `kubectl`, `curl`). Its request log is saved to `~/claude/jail/.run-<stack>/` at session end | `tools/stack-jail.sh` | Token theft (nothing to copy out); writes, secret reads, exec and port-forwards even if a session skips `kdev` | The dev token stays in the proxy sidecar; the proxy keeps refusing non-GET methods and the `secrets`, `exec`, `attach`, `portforward` and `proxy` segments for every client. |
 | `kdev`: read-verb allowlist, refuses `secret` args, prints a cluster banner; runs the repo's devbox `kubectl` with no init_hook | `tools/kdev` | *Convenience.* The proxy and RBAC are the boundary | `kdev` is convenience; a change that makes it the only barrier, such as the proxy permitting what `kdev` filters, is a finding. |
-| Argo CD on kind (above): host-applied AppProject and Applications; a get/sync/logs account, disabled between sessions, its token minted per launch over verified TLS after the policy-equality and can-i gates; a read Role for the workbench SA | `tools/kind-stack.sh`, `tools/stack-jail.sh`, `tools/stack-jail-init.sh` | A session changing what Argo deploys or where (that is the chart's and the project's, both host-applied), minting itself a longer-lived token, syncing anything outside the namespace or cluster-scoped, or editing an Application through the API. `helm install/upgrade` and `kubectl apply` are not needed in the loop, so their denies cost nothing | The Argo account stays get, sync and logs only, disabled between sessions, its token per launch with every token on the account deleted at launch and at exit, the admin login over verified TLS, the policy-equality and can-i gates before install; the AppProject keeps one source, one namespace, no cluster-scoped kinds and no Role or RoleBinding. |
+| Argo CD on kind (above): host-applied AppProject and Applications; a get/sync/logs account, disabled between sessions, its token minted per launch over verified TLS after the policy-equality and can-i gates; a read Role for the workbench SA | `tools/kind-stack.sh`, `tools/stack-jail.sh`, `tools/stack-jail-init.sh` | A session changing what Argo deploys or where (that is the chart's and the project's, both host-applied), minting itself a longer-lived token, syncing anything outside the namespace or cluster-scoped, or editing an Application through the API. `helm install/upgrade` and `kubectl apply` are not needed in the loop, so their denies cost nothing | The Argo account stays get, sync and logs only, disabled between sessions, its token per launch with every token on the account deleted at launch and at exit, the admin login over verified TLS, the policy-equality and can-i gates before install; the stack's AppProject (`<stack>`) keeps one source, one namespace, no cluster-scoped kinds and no Role or RoleBinding (project `platform` is the cluster add-ons row's). |
+| Cluster add-ons (above): `KIND_ADDONS` names files in this repo's `addons/`; `up` checks each (name, `argocd`, project `platform`, one document and source, public `https` repo, exact version, own namespace) and applies AppProject `platform` built from them, then the files | `tools/kind-stack.sh`, `addons/` | A session getting cluster-scoped objects deployed (it cannot create, edit or sync a platform app, and cannot push to a public chart repo); a conf or file edit widening the project past what the files declare; the host applying a file from a stack's tree | The `platform` project lists only the chart repos and namespaces the listed addon files declare, never `*` or the stack registry; nothing in a jail is granted on it (the jail account's policy stays `<stack>/*`); addon files are public-chart-only with a pinned version and a namespace of their own; and the host applies only files from this repo's `addons/` named by the conf, after the checks. |
 
 ### Registry
 
@@ -355,6 +370,20 @@ needs a denied verb, and nothing in the jail holds a credential for it.
   AppProject, not RBAC, bounds what a sync may create (cluster-scoped kinds and namespaced RBAC objects blacklisted). On a disposable cluster whose jail SA is
   already namespace admin that is the same trust as `kubectl` in the namespace, and the project
   and Applications are host-applied, so the jail cannot widen them.
+- **The `platform` project allows every cluster-scoped kind** (`*`/`*`): an add-on is CRDs,
+  ClusterRoles and webhooks, so a narrower list would be a list of whatever the pinned chart ships
+  today. That is the trust of the host's own kubeconfig, used on a chart the host chose by version
+  from a public repo; the jail can neither edit the project nor sync its apps. The chart's
+  maintainers are trusted as far as that version. A cluster-wide Prometheus acts on the monitors a
+  jail's chart ships: they choose scrape targets, not credentials, since
+  `arbitraryFSAccessThroughSMs` is denied (a ServiceMonitor cannot send Prometheus's own token).
+  Grafana's dashboard sidecar watches every namespace, so a jail-shipped ConfigMap labelled
+  `grafana_dashboard` becomes a dashboard in the human's admin Grafana; Prometheus is
+  unauthenticated and reachable from the stack's pods (cluster-wide metrics and metadata, no secret
+  data), and Grafana grants those pods anonymous Viewer, which reads the same data through its
+  dashboards and nothing more (no edits, datasources, users or admin login): a session must be able
+  to see what it deploys; Grafana's SA can read ConfigMaps and Secrets cluster-wide, which the jail cannot borrow
+  (it has no exec or token request in `monitoring`).
 - **The jail's Argo token travels with TLS verification off** (`ARGOCD_OPTS=--insecure`): the
   API server's certificate is self-signed, so verifying it in the jail means handing the jail the
   certificate the launcher reads. (The launcher's own admin login does verify it.) A peer that could answer on the control-plane's address is already
