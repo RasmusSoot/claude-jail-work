@@ -92,7 +92,7 @@ fi
 if [ -n "${STACK_ARGO_TOKEN:-}" ]; then
   # The argocd CLI reads these three; the token is the stack's own Argo account, get+sync only, 8h.
   export ARGOCD_SERVER="$STACK_ARGO_SERVER" ARGOCD_AUTH_TOKEN="$STACK_ARGO_TOKEN" ARGOCD_OPTS="--insecure"
-  _sj_argo="\`argocd app get|sync|wait|logs|diff <app>\` on this stack's Applications (project \`${STACK_NAME:-stack}\`, server \`$STACK_ARGO_SERVER\`, 8h token in \`ARGOCD_AUTH_TOKEN\`, the account disabled at session end; \`argocd\` itself comes from the repo's devbox). The account can get and sync, nothing else: creating, editing or deleting an Application, a repo or an account is refused by the API. Applications pull the chart version the sidecar pushed; auto-sync + self-heal is on, so a hand edit in the namespace is reverted — change the chart and push instead."
+  _sj_argo="\`argocd app get|sync|wait|logs|diff <app>\` on this stack's Applications (project \`${STACK_NAME:-stack}\`, server \`$STACK_ARGO_SERVER\`, 8h token in \`ARGOCD_AUTH_TOKEN\`, the account disabled at session end; \`argocd\` itself comes from the repo's devbox). Its rules: below, under this session's tools."
 else
   _sj_argo="no Argo CD token this session — \`argocd\` is unavailable (the stack has no ARGO_APPS, or the launcher's gate refused)."
 fi
@@ -108,7 +108,7 @@ export PATH="/workspace/tools:$PATH"                   # kdev, build-image
 {
   cat <<EOT
 # ${STACK_NAME:-stack} jail — session card
-<!-- rendered at session start by tools/stack-jail-init.sh from the injected env — edit the renderer (or tools/jail-card.md below), not this file -->
+<!-- rendered at session start by tools/stack-jail-init.sh from the injected env — edit the renderer (or tools/jail-card.md and tools/jail-card.d/), not this file -->
 
 - **Stack: ${STACK_NAME:-?}.** Mounted repos under \`/workspace\`: ${STACK_REPOS:-<none>}. Nothing else of the host is visible.
 - **Read-only views**: $(if [ -n "${STACK_READS:-}" ]; then echo "$(printf '%s' "${STACK_READS}" | tr ' ' '\n' | sed 's|\(.*\):\(.*\)|/reads/\1/\2|' | paste -sd, -) — other stacks' working trees as they are on the host, uncommitted edits included. Read, compare, cite; never try to write, build in, or push from them — their remotes and tokens are not in this jail."; else echo "none this session."; fi)
@@ -124,9 +124,23 @@ export PATH="/workspace/tools:$PATH"                   # kdev, build-image
 ---
 EOT
   if [ -f /workspace/tools/jail-card.md ]; then cat /workspace/tools/jail-card.md; else _sj_warn "tools/jail-card.md missing"; echo "(ground-rules card missing)"; fi
+  # The rules for a tool only when this session has it: a stack without kdev, argocd or an add-on
+  # does not spend context on them. One fragment per tool in tools/jail-card.d/ (build-image needs
+  # none: its session-card line above is the whole of it).
+  _sj_frags=""
+  [ -z "${STACK_DEVKUBE_PROXY:-}" ] || _sj_frags="$_sj_frags kdev"
+  [ -z "${STACK_ARGO_TOKEN:-}" ] || _sj_frags="$_sj_frags argocd"
+  if [ -n "${STACK_KUBE_TOKEN:-}" ]; then for _a in ${STACK_ADDONS:-}; do _sj_frags="$_sj_frags addon-$_a"; done; fi
+  if [ -n "$_sj_frags" ]; then
+    printf '\n## %s\n\n' "This session's tools"
+    for _f in $_sj_frags; do
+      if [ -f "/workspace/tools/jail-card.d/$_f.md" ]; then cat "/workspace/tools/jail-card.d/$_f.md"
+      else case "$_f" in addon-*) ;; *) echo "- (tools/jail-card.d/$_f.md missing: this tool's rules are not in this session)" ;; esac; fi   # an add-on may have nothing to say
+    done
+  fi
 } > /workspace/CLAUDE.local.md 2>/dev/null || _sj_warn "could not write /workspace/CLAUDE.local.md"
 
-unset _sj_kind _sj_dev _sj_git _sj_gh _sj_build _sj_argo        # GH_TOKEN stays: it is gh's, public-read-only, gated by the launcher
+unset _sj_kind _sj_dev _sj_git _sj_gh _sj_build _sj_argo _sj_frags _f _a        # GH_TOKEN stays: it is gh's, public-read-only, gated by the launcher
 # Tidiness, not a boundary: this clears claude's own environment only. The `docker run -e` values
 # stay in /proc/1/environ, readable by every process here (same user). Nothing gained by reading
 # them: the kube token is in kind.yaml, the Argo one is ARGOCD_AUTH_TOKEN.

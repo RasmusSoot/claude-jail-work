@@ -3,8 +3,10 @@
 <!-- The ONE versioned home for jail-session ground rules. Composed into the session at container
 start — never hand-pasted, never edited at the composition target (edit THIS file):
   - login jail: tools/jail-entrypoint.sh writes it to /workspace/CLAUDE.local.md;
-  - stack jail: tools/stack-jail-init.sh prepends its rendered per-stack card and writes the
-    pair to /workspace/CLAUDE.local.md (container-local). -->
+  - stack jail: tools/stack-jail-init.sh prepends its rendered per-stack card, appends the
+    fragments in tools/jail-card.d/ for the tools this session has (kdev, argocd, each
+    add-on), and writes the lot to /workspace/CLAUDE.local.md (container-local).
+Rules for one tool go in its fragment, so a stack without the tool does not pay for them. -->
 
 You are running inside a Docker container that holds only this stack's repositories and a small
 set of scoped credentials. The permission mode is whatever the account's policy allows; in a stack
@@ -36,23 +38,12 @@ pushes.
   refuses to run at all. Pull requests, comments, issues and releases are the human's, from the
   host. The session card says which of the two states this session is in.
 - **kubectl**: plain `kubectl` is the LOCAL KIND cluster (namespace-admin, disposable — destructive
-  verbs are fine there). `kdev` is the CLIENT DEV cluster, read-only through a proxy that holds the
-  token (no credential is in this jail): anything but GET, and any secrets, exec, attach,
-  port-forward or proxy request, gets 403. `kdev auth can-i` does not work (it is a POST). Never set
-  `KUBECONFIG` by hand, never `use-context`, never merge the two files. Every `kdev` call prints its
-  cluster banner — read it.
-- **argocd**: when the stack has Argo CD on its kind cluster, the session card carries an 8h token
-  for an account that can `get`, `sync` and read `logs` on this stack's Applications and nothing
-  else — no app, repo, project or account writes; the API answers those with permission denied,
-  which is the policy, not a bug. Applications track the chart in the stack registry (any version),
-  so the loop is: change the chart, `build-image --chart`, `argocd app sync`. Self-heal is on: a
-  `kubectl` edit in the namespace is reverted; put it in the chart. `helm install/upgrade` stay
-  denied and are not needed.
+  verbs are fine there). Never set `KUBECONFIG` by hand and never `use-context`.
 - **No client fact in any repo**: CIDRs, hostnames, ServiceAccount names, the GitLab URL — these
   live in the human's gitignored env file. Charts and configs you write come from public sources
   or from the client's own repo, never retyped into a third place.
 - **Secrets**: if a command output contains a token, key or personal data, say so generically and
-  do not echo it. `kdev` cannot read secrets on purpose; do not look for another way.
+  do not echo it. Where a tool cannot read secrets, that is on purpose; do not look for another way.
 
 ## Environment
 
@@ -63,13 +54,7 @@ pushes.
   stack, never the host's), so `devbox install` / `devbox run` work here directly; the same
   committed `devbox.json` works on the host against the host's own store.
 - Memory and session history persist at `/home/claude/.claude` (bind-mounted per stack).
-- A stack may declare `READS`: other stacks' repo dirs mounted read-only under
-  `/reads/<stack>/<repo>`.
-  They are views, not workspaces — no tokens for them, no commits in them.
-- **No docker, no image push from here.** When the stack has a build sidecar, `build-image` (in
-  `tools/`) explodes a jar into `/workspace/build/<id>/` and the sidecar runs the Paketo lifecycle
-  on it and pushes image and chart to the stack's kind registry, names from an allowlist only. The
-  session card says whether it is there. Do not look for another way to push.
+- **No docker, no image push from here.** Do not look for another way to push.
 - Published ports are loopback-only on the host. The upload server (inbox: `notes/uploads/` in a
   stack jail) needs the per-session token printed at launch — never echo or log that URL.
 
@@ -79,5 +64,3 @@ pushes.
 - **Prior-art check before creating anything named** (a doc, script, chart, manifest): grep the
   repo first and say what you found before writing. Extend what exists; never create a parallel one.
 - **Resolve references before acting on them.** When the human names a thing, it exists — find it.
-- **Two clusters means every claim names its cluster.** "Works" is not a finding; "works on kind,
-  dev shows X" is.

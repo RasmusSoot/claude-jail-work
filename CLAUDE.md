@@ -1,7 +1,8 @@
 # claude-jail-work — per-stack Claude Code jails under an employer-managed policy
 
 Repo facts only. **Session ground rules do not live here** — they live in
-[`tools/jail-card.md`](tools/jail-card.md), composed into `CLAUDE.local.md` at container start.
+[`tools/jail-card.md`](tools/jail-card.md), composed into `CLAUDE.local.md` at container start,
+plus the per-tool fragments in `tools/jail-card.d/` a stack session gets only when it has the tool.
 Derived from the home variant (`upstream`, fetch-only); cherry-pick in either direction
 deliberately.
 

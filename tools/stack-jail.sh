@@ -515,6 +515,7 @@ else
 fi
 export STACK_KUBE_TOKEN STACK_KUBE_SERVER STACK_KUBE_CA STACK_KUBE_NS="$KIND_NS" STACK_KUBE_SA="$KIND_SA"
 export STACK_ARGO_SERVER STACK_ARGO_TOKEN
+STACK_ADDONS="${KIND_ADDONS:-}"; export STACK_ADDONS              # names only: which add-on card fragments the session gets (tools/jail-card.d/)
 export STACK_DEVKUBE_NS="${DEV_KUBE_NS:-}" STACK_DEVKUBE_SA="${DEV_KUBE_SA:-}"   # the dev token itself never enters the jail
 
 
@@ -877,7 +878,7 @@ docker compose -f "$HERE/docker-compose.yml" run --rm --name "jail-$STACK" \
   -e STACK_GITPROXY -e GITPROXY_WRITE -e GITLAB_HOST -e GITLAB_FORK_PATH -e FORK_ORG -e GH_TOKEN \
   -e STACK_KUBE_TOKEN -e STACK_KUBE_SERVER -e STACK_KUBE_CA -e STACK_KUBE_NS -e STACK_KUBE_SA \
   -e STACK_DEVKUBE_PROXY -e STACK_DEVKUBE_NS -e STACK_DEVKUBE_SA \
-  -e STACK_BUILD_DIR -e STACK_BUILD_REGISTRY -e STACK_BUILD_NAMES -e STACK_ARGO_SERVER -e STACK_ARGO_TOKEN \
+  -e STACK_BUILD_DIR -e STACK_BUILD_REGISTRY -e STACK_BUILD_NAMES -e STACK_ARGO_SERVER -e STACK_ARGO_TOKEN -e STACK_ADDONS \
   stack \
   bash -c "source /workspace/tools/stack-jail-init.sh && cd /workspace/$PRIMARY && exec claude ${JAIL_CLAUDE_FLAGS:-}"
 
