@@ -198,6 +198,14 @@ class AddonsProjectTest(unittest.TestCase):
         msg = self.refused(KPS.replace("      valuesObject:\n", "      valueFiles: [values-kind.yaml]\n      valuesObject:\n", 1))
         self.assertIn("valueFiles", msg)
 
+    def test_keys_kubectl_would_read_but_the_parse_would_not_are_refused(self):
+        for extra in ("kind : List\nitems:\n- kind: ClusterRoleBinding\n", "<<: *base\n", "base: &base\n  a: b\n", "x: |\n  y\n", "\tkind: List\n"):
+            with self.subTest(extra=extra):
+                self.assertIn("not a plain key", self.refused(KPS + extra))
+
+    def test_the_real_addon_files_pass_the_strict_parse(self):
+        self.assertIn("monitoring", run('KIND_CLUSTER=t\nKIND_ADDONS="kube-prometheus-stack"\n', "addons-render"))
+
     def test_a_quoted_key_is_refused(self):
         self.assertIn("quoted key", self.refused(KPS.replace("  project: platform", '  project: platform\n  "project": t')))
 

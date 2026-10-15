@@ -42,7 +42,8 @@ set -eu
 me="$(dirname "$0")/.."
 case "$1" in
   show)  tar -xzOf "$3" --wildcards '*/Chart.yaml' ;;
-  push)  printf '%s\n' "$@" > "$me/helm.args"; cp "$HELM_REGISTRY_CONFIG" "$me/helm.registry.json"
+  push)  [ "${FAKE_HELM_PUSH_FAIL:-}" = 1 ] && { echo "push denied"; exit 1; }
+         printf '%s\n' "$@" > "$me/helm.args"; cp "$HELM_REGISTRY_CONFIG" "$me/helm.registry.json"
          echo "Pushed: $3/x"; echo "Digest: sha256:c0ffee" ;;
   *)     echo "unexpected helm $1" >&2; exit 1 ;;
 esac
@@ -172,6 +173,9 @@ class BuilderTest(unittest.TestCase):
         copy = self.root / "reqtmp" / "req-r1"  # /tmp/req-<id> in the sidecar (its tmpfs)
         self.assertEqual(Path(platform), copy / "platform")
         self.assertEqual(Path(report), copy / "report.toml")
+        end = time.monotonic() + 3  # removed right after result.env is renamed into place: wait for it
+        while copy.exists() and time.monotonic() < end:
+            time.sleep(0.05)
         self.assertFalse(copy.exists())
         req = self.root / "build" / "r1"
         self.assertEqual(sorted(p.name for p in req.iterdir()), ["app", "log", "request", "request.env", "result.env", "started"])
@@ -238,6 +242,67 @@ class BuilderTest(unittest.TestCase):
     def test_chart_declared_without_a_tarball_is_refused(self):
         self.start()
         res = self.request("r1", "demo:1", chart="demo")
+        self.assertEqual(res["STATUS"], "failed")
+        self.assertIn("no chart.tgz", (self.root / "build" / "r1" / "log").read_text())
+
+    def chart_only(self, rid: str, chart: str, chart_name: str | None) -> dict:
+        d = self.root / "build" / rid
+        d.mkdir(parents=True)
+        if chart_name is not None:
+            chart_tgz(d / "chart.tgz", chart_name)
+        (d / "request.env").write_text(f"CHART={chart}\n")
+        (d / "request").write_text("")
+        return self.wait_result(d)
+
+    def test_chart_only_request_pushes_the_chart_without_running_the_lifecycle(self):
+        self.start(names="demo lab")
+        res = self.chart_only("r1", "lab", "lab")
+        self.assertEqual(res["STATUS"], "ok")
+        self.assertEqual(res["CHART"], "lab")
+        self.assertEqual(res["CHART_DIGEST"], "sha256:c0ffee")
+        self.assertNotIn("IMAGE", res)
+        self.assertFalse((self.root / "creator.args").exists())
+        self.assertEqual((self.root / "helm.args").read_text().split("\n")[2], f"oci://{REGISTRY}/charts")
+
+    def test_chart_only_outside_the_allowlist_is_refused(self):
+        self.start(names="demo")
+        res = self.chart_only("r1", "lab", "lab")
+        self.assertEqual(res["STATUS"], "failed")
+        self.assertIn("be in BUILD_NAMES", (self.root / "build" / "r1" / "log").read_text())
+        self.assertFalse((self.root / "helm.args").exists())
+
+    def test_chart_only_whose_tarball_names_another_chart_is_refused(self):
+        self.start(names="demo lab")
+        res = self.chart_only("r1", "lab", "demo")
+        self.assertEqual(res["STATUS"], "failed")
+        self.assertFalse((self.root / "helm.args").exists())
+
+    def test_chart_only_push_failure_is_reported(self):
+        self.start(names="lab", FAKE_HELM_PUSH_FAIL="1")
+        res = self.chart_only("r1", "lab", "lab")
+        self.assertEqual(res["STATUS"], "failed")
+        self.assertIn("push denied", (self.root / "build" / "r1" / "log").read_text())
+
+    def test_chart_only_with_a_symlinked_tarball_is_refused(self):
+        self.start(names="lab")
+        d = self.root / "build" / "r1"
+        d.mkdir(parents=True)
+        chart_tgz(self.root / "real.tgz", "lab")
+        (d / "chart.tgz").symlink_to(self.root / "real.tgz")
+        (d / "request.env").write_text("CHART=lab\n")
+        (d / "request").write_text("")
+        self.assertEqual(self.wait_result(d)["STATUS"], "failed")
+        self.assertFalse((self.root / "helm.args").exists())
+
+    def test_a_chart_name_that_is_not_a_name_is_refused(self):
+        self.start(names="demo lab")
+        res = self.chart_only("r1", "demo lab", "demo lab")
+        self.assertEqual(res["STATUS"], "failed")
+        self.assertIn("is not a chart name", (self.root / "build" / "r1" / "log").read_text())
+
+    def test_chart_only_without_a_tarball_is_refused(self):
+        self.start(names="lab")
+        res = self.chart_only("r1", "lab", None)
         self.assertEqual(res["STATUS"], "failed")
         self.assertIn("no chart.tgz", (self.root / "build" / "r1" / "log").read_text())
 

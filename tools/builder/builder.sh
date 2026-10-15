@@ -4,9 +4,10 @@
 # tools/build-image. No daemon, no socket: this is `pack build` with the container already running.
 #
 # Protocol, over the shared build directory (/build here, /workspace/build in the jail):
-#   /build/<id>/app/            the application directory (an exploded Spring Boot jar)
-#   /build/<id>/chart.tgz       optional, a packaged Helm chart to push after the image
-#   /build/<id>/request.env     IMAGE=<name>:<tag>  CHART=<chart name>  BP_*=…  (one KEY=value per line)
+#   /build/<id>/app/            the application directory (an exploded Spring Boot jar); absent in a chart-only request
+#   /build/<id>/chart.tgz       optional, a packaged Helm chart to push after the image (or alone: no IMAGE)
+#   /build/<id>/request.env     IMAGE=<name>:<tag>  CHART=<chart name>  BP_*=…  (one KEY=value per line);
+#                               CHART without IMAGE = chart-only: no lifecycle, only the chart push
 #   /build/<id>/request         marker: the request is complete, build it
 #   /build/<id>/log             appended while building (the one file written while reading the request;
 #                               the request itself is read from a tmpfs copy, see build_one)
@@ -95,8 +96,27 @@ build_one() { # <request dir>
   rm -rf "$t"
 }
 
+chart_check() { # <request dir> <tmpfs copy> <CHART> <IMAGE for the result> → sets ctgz; on refusal writes the result, returns 1
+  local d="$1" t="$2" chart="$3" image="$4" cname
+  [[ $chart =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "refused: CHART='$chart' is not a chart name" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image" "CHART=$chart"; return 1; }
+  [ -f "$t/chart.tgz" ] || { echo "refused: CHART=$chart but no chart.tgz" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image" "CHART=$chart"; return 1; }
+  ctgz="$t/chart.tgz"                                        # validated and pushed from the tmpfs copy: the jail cannot swap it between the two
+  cname=$(helm show chart "$ctgz" 2>>"$d/log" | sed -n 's/^name: *//p' | head -1)
+  if [ -z "$cname" ] || [ "$cname" != "$chart" ] || ! allowed "$cname"; then
+    echo "refused: chart.tgz is '$cname', CHART=$chart; must match and be in BUILD_NAMES" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image" "CHART=$chart"; return 1
+  fi
+}
+chart_push() { # <request dir> <tmpfs copy> → sets cdig; returns 1 on failure (the caller writes the result)
+  local d="$1" t="$2"
+  if ! helm push "$ctgz" "oci://$REGISTRY/charts" --plain-http > "$t/chart-push.out" 2>&1; then
+    cat "$t/chart-push.out" >> "$d/log"; return 1
+  fi
+  cat "$t/chart-push.out" >> "$d/log"
+  cdig=$(sed -n 's/^Digest: *//p' "$t/chart-push.out" | head -1)
+}
+
 build_copy() { # <request dir: log and result go here> <its copy in tmpfs: everything is read from here>
-  local d="$1" t="$2" id image="" chart="" name tag ref line k v idig="" cdig="" cname ctgz
+  local d="$1" t="$2" id image="" chart="" name tag ref line k v idig="" cdig="" ctgz
   id=$(basename "$d")
   mkdir -p "$t/platform/env"
   { echo "── $id: $(date -u +%FT%TZ)"; } >> "$d/log"
@@ -111,6 +131,15 @@ build_copy() { # <request dir: log and result go here> <its copy in tmpfs: every
     esac
   done < "$t/request.env"
 
+  # Chart-only (a lab chart: dashboards, fixtures, no application of its own): the same chart
+  # checks, no lifecycle, no app dir needed.
+  if [ -z "$image" ] && [ -n "$chart" ]; then
+    chart_check "$d" "$t" "$chart" "" || return 0
+    log "$id: chart only: $chart"
+    if ! chart_push "$d" "$t"; then log "$id: chart push FAILED"; result "$d" STATUS=failed "CHART=$chart"; return; fi
+    log "$id: done chart $chart${cdig:+@$cdig}"
+    result "$d" STATUS=ok "CHART=$chart" "CHART_DIGEST=$cdig"; return
+  fi
   # Validate before anything leaves: name:tag shape, name on the allowlist, an app dir to build.
   if ! printf '%s' "$image" | grep -qE '^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
     echo "refused: IMAGE='$image' is not <name>:<tag>" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image"; return
@@ -123,14 +152,7 @@ build_copy() { # <request dir: log and result go here> <its copy in tmpfs: every
     echo "refused: $d/app is missing or empty" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image"; return
   fi
   ctgz=""
-  if [ -n "$chart" ] || [ -f "$t/chart.tgz" ]; then
-    [ -f "$t/chart.tgz" ] || { echo "refused: CHART=$chart but no chart.tgz" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image"; return; }
-    ctgz="$t/chart.tgz"                                      # validated and pushed from the tmpfs copy: the jail cannot swap it between the two
-    cname=$(helm show chart "$ctgz" 2>>"$d/log" | sed -n 's/^name: *//p' | head -1)
-    if [ -z "$cname" ] || [ "$cname" != "$chart" ] || ! allowed "$cname"; then
-      echo "refused: chart.tgz is '$cname', CHART=$chart; must match and be in BUILD_NAMES" >> "$d/log"; result "$d" STATUS=failed "IMAGE=$image"; return
-    fi
-  fi
+  if [ -n "$chart" ] || [ -f "$t/chart.tgz" ]; then chart_check "$d" "$t" "$chart" "$image" || return 0; fi
 
   ref="$REGISTRY/$name:$tag"
   log "$id: building $ref${chart:+ + chart $chart}"
@@ -145,13 +167,8 @@ build_copy() { # <request dir: log and result go here> <its copy in tmpfs: every
     log "$id: image build FAILED"; result "$d" STATUS=failed "IMAGE=$ref"; return
   fi
   idig=$(sed -n 's/^ *digest *= *"\([^"]*\)".*/\1/p' "$t/report.toml" 2>/dev/null | head -1)
-  if [ -n "$chart" ]; then
-    if ! helm push "$ctgz" "oci://$REGISTRY/charts" --plain-http > "$t/chart-push.out" 2>&1; then
-      cat "$t/chart-push.out" >> "$d/log"; log "$id: chart push FAILED"
-      result "$d" STATUS=failed "IMAGE=$ref" "IMAGE_DIGEST=$idig" "CHART=$chart"; return
-    fi
-    cat "$t/chart-push.out" >> "$d/log"
-    cdig=$(sed -n 's/^Digest: *//p' "$t/chart-push.out" | head -1)
+  if [ -n "$chart" ] && ! chart_push "$d" "$t"; then
+    log "$id: chart push FAILED"; result "$d" STATUS=failed "IMAGE=$ref" "IMAGE_DIGEST=$idig" "CHART=$chart"; return
   fi
   log "$id: done $ref${idig:+@$idig}${chart:+; chart $chart${cdig:+@$cdig}}"
   result "$d" STATUS=ok "IMAGE=$ref" "IMAGE_DIGEST=$idig" "CHART=$chart" "CHART_DIGEST=$cdig"

@@ -3,6 +3,8 @@
 # chart) to the Paketo lifecycle running in the sidecar, wait, print what was pushed.
 #
 #   build-image <app.jar> --name <image name> [--tag <tag>] [--chart <chart.tgz>] [--env BP_X=y]…
+#   build-image --chart <chart.tgz>        chart only: a chart with no application of its own
+#                                          (a lab chart: dashboards, fixtures); no build, just the push
 #
 # Nothing here pushes: the jar is exploded into the shared build directory as a request, and the
 # sidecar (tools/builder/builder.sh) builds it in the real builder image and pushes the image and
@@ -14,7 +16,7 @@
 # Exit status is the build's. BUILD_TIMEOUT (seconds, default 1200) bounds the wait.
 set -euo pipefail
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die() { echo "build-image: $*" >&2; exit 1; }
 
 BUILD_DIR="${STACK_BUILD_DIR:-}"
@@ -23,15 +25,28 @@ BUILD_DIR="${STACK_BUILD_DIR:-}"
 jar="" name="" tag="" chart="" envs=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --name)  name="${2:-}"; shift 2 ;;
-    --tag)   tag="${2:-}"; shift 2 ;;
-    --chart) chart="${2:-}"; shift 2 ;;
-    --env)   envs+=("${2:-}"); shift 2 ;;
+    --name|--tag|--chart|--env) [ $# -ge 2 ] || die "$1 needs a value"
+      case "$1" in --name) name="$2" ;; --tag) tag="$2" ;; --chart) chart="$2" ;; --env) envs+=("$2") ;; esac; shift 2 ;;
     -h|--help) usage ;;
     -*) die "unknown option $1" ;;
     *) [ -z "$jar" ] || die "one jar only"; jar="$1"; shift ;;
   esac
 done
+if [ -z "$jar" ] && [ -n "$chart" ]; then   # chart only: the name is the chart's own, the version is its Chart.yaml's
+  [ -f "$chart" ] || die "$chart is not a file"
+  [ -z "$tag" ] && [ ${#envs[@]} -eq 0 ] || die "--tag and --env are for an image build; a chart-only push takes the version from Chart.yaml"
+  chart_name=$(tar -xzOf "$chart" --wildcards '*/Chart.yaml' 2>/dev/null | sed -n 's/^name: *//p' | head -1) || true
+  [ -n "$chart_name" ] || die "could not read the chart name from $chart"
+  [ -z "$name" ] || [ "$name" = "$chart_name" ] || die "--name $name but the chart is '$chart_name'"
+  case " ${STACK_BUILD_NAMES:-} " in *" $chart_name "*) ;; *) die "'$chart_name' is not in this stack's BUILD_NAMES (${STACK_BUILD_NAMES:-<none>}) — the sidecar would refuse it" ;; esac
+  chart_version=$(tar -xzOf "$chart" "$chart_name/Chart.yaml" 2>/dev/null | sed -n 's/^version: *//p' | tr -d "\"'" | head -1) || true
+  req=$(mktemp -d "$BUILD_DIR/$chart_name-chart-${chart_version:-x}-XXXXXX"); id=$(basename "$req")   # unique: two calls in one second must not share a dir
+  cp "$chart" "$req/chart.tgz"
+  echo "CHART=$chart_name" > "$req/request.env"
+  : > "$req/log"; : > "$req/request"
+  echo "build-image: request $id → chart $chart_name ${chart_version:-?} only (log: $req/log)" >&2
+  echo "build-image: Argo caches a chart by version — bump Chart.yaml's version for every push you want deployed" >&2
+else
 [ -n "$jar" ] && [ -n "$name" ] || usage
 [ -f "$jar" ] || die "$jar is not a file"
 case " ${STACK_BUILD_NAMES:-} " in *" $name "*) ;; *) die "'$name' is not in this stack's BUILD_NAMES (${STACK_BUILD_NAMES:-<none>}) — the sidecar would refuse it" ;; esac
@@ -80,6 +95,7 @@ fi
 : > "$req/log"
 : > "$req/request"                                              # the marker: complete, build it
 echo "build-image: request $id → $name:$tag${chart_name:+ + chart $chart_name} (log: $req/log)" >&2
+fi
 
 tail -n +1 -f "$req/log" >&2 & tp=$!
 deadline=$(( $(date +%s) + ${BUILD_TIMEOUT:-1200} ))
@@ -90,6 +106,6 @@ done
 sleep 0.5; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null || true
 get() { sed -n "s/^$1=//p" "$req/result.env" | head -1; }
 status=$(get STATUS)
-echo "image: $(get IMAGE)${status:+ }$( [ -n "$(get IMAGE_DIGEST)" ] && echo "@$(get IMAGE_DIGEST)")"
+[ "$status" = ok ] || die "build $status — see $req/log (the lines above say what, if anything, was pushed)"
+[ -z "$(get IMAGE)" ] || echo "image: $(get IMAGE)$( [ -n "$(get IMAGE_DIGEST)" ] && echo "@$(get IMAGE_DIGEST)")"
 [ -z "$(get CHART)" ] || echo "chart: oci://${STACK_BUILD_REGISTRY:-?}/charts/$(get CHART)$( [ -n "$(get CHART_DIGEST)" ] && echo " @$(get CHART_DIGEST)")"
-[ "$status" = ok ] || die "build $status — see $req/log"

@@ -97,7 +97,7 @@ else
   _sj_argo="no Argo CD token this session — \`argocd\` is unavailable (the stack has no ARGO_APPS, or the launcher's gate refused)."
 fi
 if [ -n "${STACK_BUILD_DIR:-}" ]; then
-  _sj_build="\`build-image <app.jar> --name <name> [--tag T] [--chart chart.tgz] [--env BP_X=y]\` hands the jar (and chart) to a build sidecar that runs the Paketo lifecycle and pushes to \`${STACK_BUILD_REGISTRY}\` — names allowed: ${STACK_BUILD_NAMES}. Nothing in this jail pushes; the sidecar holds the registry credential. Requests and logs: \`${STACK_BUILD_DIR}/<id>/\`."
+  _sj_build="\`build-image <app.jar> --name <name> [--tag T] [--chart chart.tgz] [--env BP_X=y]\` (or \`build-image --chart <chart.tgz>\` alone, for a lab chart with no application) hands the jar (and chart) to a build sidecar that runs the Paketo lifecycle and pushes to \`${STACK_BUILD_REGISTRY}\` — names allowed: ${STACK_BUILD_NAMES}. Nothing in this jail pushes; the sidecar holds the registry credential. Requests and logs: \`${STACK_BUILD_DIR}/<id>/\`."
 else
   _sj_build="no build sidecar this session — images cannot be built or pushed from here."
 fi

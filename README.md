@@ -198,7 +198,7 @@ By design:
      builder plus helm, image `jail-<stack>-builder`), which runs the CNB lifecycle on requests
      from the shared `~/claude/jail/<stack>/build` dir and pushes image and chart to the kind
      registry, `BUILD_NAMES` only, holding the registry credential the jail never gets (jail
-     side: `tools/build-image`).
+     side: `tools/build-image`; `--chart` with no jar pushes a lab chart alone).
 
    Then it starts `claude` in that namespace with no git token, no dev token and no bypass flag,
    and removes the sidecars (saving their request logs) when the session ends.

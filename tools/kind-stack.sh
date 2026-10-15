@@ -464,17 +464,22 @@ EOT
 # anything is applied each listed file must say what the conf says: one Application document named
 # <name> in argocd, project platform, a public https chart repo (never the stack registry, which
 # the jail pushes to: a jail-pushed chart in this project would be cluster-admin), an exact version,
-# a namespace of its own, the chart's values inline. Block-style YAML: lines the parse cannot place
-# are ignored, so the required paths must each occur exactly once; a quoted key and any `---` (a
-# leading one included) are refused outright.
+# a namespace of its own, the chart's values inline. Block-style YAML only, and strictly: every line
+# is blank, a comment, a list item or a plain `key:` / `key: value`, or the file is refused — so
+# `kind : List`, `<<:` merges, anchors and aliases, quoted keys, tabs, block scalars and any `---`
+# (a leading one included) cannot make kubectl read a key this parse did not see; the required
+# paths must each occur exactly once.
 addon_fields() { # <file> → "dotted.path=value" per mapping key (lists and comments skipped)
   awk '
     /^---/ { print "!multidoc"; next }
     /^ *["\047]/ { print "!quotedkey"; next }
+    /\t/ { print "!unparsed " NR; next }
     /^[[:space:]]*(#|$)/ { next }
     { match($0, /^ */); ind = RLENGTH; line = substr($0, ind + 1)
-      if (line ~ /^- / || !match(line, /^[A-Za-z0-9_.\/-]+:/)) next
-      key = substr(line, 1, RLENGTH - 1); val = substr(line, RLENGTH + 1)
+      if (line ~ /^-( |$)/) { if (line ~ /^- *[&*!|>]/) print "!unparsed " NR; next }
+      if (!match(line, /^[A-Za-z0-9_.\/-]+:( |$)/)) { print "!unparsed " NR; next }
+      key = substr(line, 1, RLENGTH - 1); sub(/:$/, "", key); sub(/: $/, "", key); val = substr(line, RLENGTH + 1)
+      if (val ~ /^[[:space:]]*[&*!|>]/) { print "!unparsed " NR; next }
       while (n > 0 && indent[n] >= ind) n--
       n++; indent[n] = ind; name[n] = key; p = name[1]; for (i = 2; i <= n; i++) p = p "." name[i]
       sub(/[[:space:]]+#.*$/, "", val); gsub(/^[[:space:]]+|[[:space:]]+$/, "", val); gsub(/^["\047]|["\047]$/, "", val)
@@ -498,6 +503,8 @@ addons_check() { # sets ADDON_REPOS ADDON_NSES (deduplicated) from the files KIN
     bad() { fail "FATAL: addons/$n.yaml: $*"; exit 2; }
     printf '%s\n' "$fields" | grep -qx '!multidoc' && bad "a --- line (one YAML document, no separator)"
     printf '%s\n' "$fields" | grep -qx '!quotedkey' && bad "a quoted key (plain keys only, so a duplicate cannot slip past a check)"
+    v=$(printf '%s\n' "$fields" | sed -n 's/^!unparsed //p' | paste -sd, -)
+    [ -z "$v" ] || bad "line(s) $v are not a plain key, list item or comment (no 'key :', merges, anchors, aliases, tags, block scalars or tabs)"
     [ "$(addon_field "$fields" apiVersion)" = argoproj.io/v1alpha1 ] && [ "$(addon_field "$fields" kind)" = Application ] \
       || bad "not one argoproj.io/v1alpha1 Application"
     [ "$(addon_field "$fields" metadata.name)" = "$n" ] || bad "metadata.name is not $n"

@@ -40,7 +40,8 @@ spec:
             podMonitorSelectorNilUsesHelmValues: false
             ruleSelectorNilUsesHelmValues: false
             probeSelectorNilUsesHelmValues: false
-            scrapeConfigSelectorNilUsesHelmValues: false
+            # ScrapeConfigs stay release-labelled only (the chart default): nothing needs them, and the
+            # file-access deny below covers ServiceMonitors, PodMonitors and Probes, not ScrapeConfigs.
             retention: 2d
             # A ServiceMonitor from any namespace (a jail's chart ships one) must not be able to name a
             # file on Prometheus's filesystem, e.g. bearerTokenFile = its own SA token, sent to a jail pod.
@@ -60,6 +61,7 @@ spec:
           # reads from Prometheus directly; editing, datasources, users and the admin login stay closed.
           grafana.ini:
             auth.anonymous: { enabled: true, org_role: Viewer }
+            snapshots: { enabled: false, external_enabled: false }   # no snapshot store, and no egress to an external one
   destination:
     server: https://kubernetes.default.svc
     namespace: monitoring
